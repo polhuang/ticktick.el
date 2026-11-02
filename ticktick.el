@@ -1211,5 +1211,7 @@ Use this if the state file becomes corrupted."
         (delete-file state-file)))
     (message "Sync state cleared. Run ticktick-sync to rebuild state.")))
 
+(require 'ticktick-reconcile)
+
 (provide 'ticktick)
 ;;; ticktick.el ends here

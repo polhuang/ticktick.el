@@ -120,4 +120,29 @@
         ;; One request for the project list, one for Inbox; no refetch.
         (should (= 2 (length ticktick-test--requests)))))))
 
+(ert-deftest ticktick-snapshot-normalizes-tags-and-timed-deadlines ()
+  (let* ((task '(:title "Test" :content " body " :tags ("z" "a" "z")
+                 :dueDate "2026-11-06T15:30:00+0200" :isAllDay :false
+                 :timeZone "Europe/Helsinki" :projectId "work"))
+         (snapshot (ticktick--snapshot-from-api task)))
+    (should (equal (plist-get snapshot :tags) '("a" "z")))
+    (should (equal (plist-get snapshot :content) "body"))
+    (should (equal (plist-get (plist-get snapshot :deadline) :value)
+                   "2026-11-06T13:30:00Z"))
+    (should (equal (cdr (assoc "timeZone" (ticktick--snapshot-to-payload snapshot)))
+                   "Europe/Helsinki"))))
+
+(ert-deftest ticktick-snapshot-org-ignores-sync-properties ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Work\n:PROPERTIES:\n:TICKTICK_PROJECT_ID: work\n:END:\n"
+            "** TODO [#A] Test :z:a:\nDEADLINE: <2026-11-06 Fri>\nbody\n")
+    (goto-char (point-min)) (search-forward "** TODO") (beginning-of-line)
+    (let ((snapshot (ticktick--snapshot-from-org)))
+      (org-set-property "LAST_SYNCED" "now")
+      (org-set-property "TICKTICK_ID" "123")
+      (should (equal snapshot (ticktick--snapshot-from-org)))
+      (should (equal (plist-get snapshot :tags) '("a" "z")))
+      (should (equal (plist-get (plist-get snapshot :deadline) :value) "2026-11-06")))))
+
 ;;; ticktick-test.el ends here
