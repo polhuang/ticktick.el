@@ -9,7 +9,7 @@ ticktick.el enables two-way synchronization between [TickTick](https://ticktick.
 
 ## Features
 
-- **Bidirectional sync**
+- **Bidirectional sync** with saved baselines, field-level merging, and explicit conflict review
 - **OAuth2 authentication**
 - **Preserves task metadata**: priorities, due dates, completion status, descriptions, tags
 - **Project-based organization** matching TickTick's structure
@@ -84,7 +84,9 @@ M-x ticktick-sync
 
 | Command | Description |
 |---------|-------------|
-| `ticktick-sync` | Full bidirectional sync |
+| `ticktick-sync` | Fetch, compare, and reconcile both sides |
+| `ticktick-preview-sync` | Preview changes without writing tasks |
+| `ticktick-review-conflicts` | Review and resolve conflicting tasks |
 | `ticktick-fetch-to-org` | Pull tasks from TickTick to Org |
 | `ticktick-push-from-org` | Push Org tasks to TickTick |
 | `ticktick-authorize` | Set up OAuth authentication |
@@ -100,7 +102,7 @@ Tasks are stored in `~/.emacs.d/ticktick/ticktick.org` with this structure:
 :PROPERTIES:
 :TICKTICK_PROJECT_ID: abc123
 :END:
-** TODO Task Title [#A]
+** TODO [#A] Task Title
 DEADLINE: <2024-01-15 Mon>
 :PROPERTIES:
 :TICKTICK_ID: def456
@@ -122,8 +124,9 @@ Task description content here.
 ;; Directory for storing tokens and data (default: ~/.emacs.d/ticktick/)
 (setq ticktick-dir "/path/to/ticktick/data/")
 
-;; Enable automatic syncing on focus changes (default: nil)
-(setq ticktick--autosync t)
+;; Enable automatic syncing on focus loss (default: nil)
+(setq ticktick-autosync t)
+(ticktick-enable-autosync-on-blur)
 
 ;; Enable automatic syncing every N minutes (default: nil)
 (setq ticktick-sync-interval 30)
@@ -136,14 +139,16 @@ Task description content here.
 
 Enable automatic syncing with one of these methods:
 
-**Focus-based syncing** (syncs when switching buffers or losing focus):
+**Focus-based syncing** (syncs when Emacs loses window focus):
 ```elisp
-(setq ticktick--autosync t)
+(setq ticktick-autosync t)
+(ticktick-enable-autosync-on-blur)
 ```
 
 **Timer-based syncing** (syncs every N minutes):
 ```elisp
-(setq ticktick-sync-interval 30)  ; Sync every 30 minutes
+(setq ticktick-sync-interval 30)
+(ticktick-toggle-sync-timer)
 ```
 
 You can also toggle timer syncing interactively:
@@ -162,7 +167,7 @@ Create tasks by just adding a `TODO` heading directly in your org file under any
 :PROPERTIES:
 :TICKTICK_PROJECT_ID: project123
 :END:
-** TODO Review quarterly reports [#A]
+** TODO [#A] Review quarterly reports
 DEADLINE: <2024-01-20 Sat>
 Need to analyze Q4 performance metrics and prepare summary.
 ```
@@ -188,9 +193,33 @@ Org priorities are mapped to TickTick priorities.
 Tags are synchronized between TickTick and Org mode using Org's native tag syntax:
 
 ```org
-** TODO Task with tags [#A]     :work:urgent:
+** TODO [#A] Task with tags     :work:urgent:
 DEADLINE: <2024-01-20 Sat>
 Task description here.
 ```
 
 Tags from TickTick are automatically converted to Org tags, and any tags you add to tasks in Org will be synced back to TickTick.
+
+## Conflict resolution
+
+`ticktick-sync` fetches remote tasks before writing changes. It compares each task with the last successfully reconciled version, saved in `.ticktick-state.el` under `ticktick-dir`.
+
+Independent edits merge automatically: changing a title in Org and a priority in TickTick preserves both changes. Different edits to the same field leave the entire task unresolved. Descriptions, tag lists, and deadline details are each compared as whole fields. New installations import remote tasks and create local tasks; existing matching IDs without a baseline require review if their values differ.
+
+Run `M-x ticktick-preview-sync` to inspect a plan, or `M-x ticktick-review-conflicts` after syncing. The review shows the base, Org, and TickTick versions. Choose either copy, edit a merged task, delete both copies, or leave the task deferred. In the merge editor, `C-c C-c` applies the result and `C-c C-k` cancels. `g` in the review fetches fresh versions. A resolution is refused if either source has changed since it was reviewed.
+
+The directional commands preserve conflicts too. A merge requiring writes to both sides is deferred until a full `ticktick-sync`. Background syncing records conflicts without asking interactive questions.
+
+### Deletions and interrupted syncs
+
+The default `ticktick-delete-behavior` is `ask`, which queues deletions for review. `archive` archives local removals, `delete` applies unambiguous deletions automatically, and `sync-only` keeps deletion decisions pending. A task edited on one side and deleted on the other always requires review. Keeping an edited Org task after remote deletion recreates it and records the new ID.
+
+Pending operations are saved before mutation. A later sync can finish a verified remote write whose local save failed. An uncertain creation is never submitted again automatically: attach the returned task ID using `ticktick-link-pending-creation`, or explicitly verify that no remote copy exists before using `ticktick-retry-pending-creation`. Both actions are available in the review buffer.
+
+Deadlines preserve time, time zone, and second precision; Org displays timed deadlines in Emacs's local time zone. Unrelated Org properties are preserved. Do not remove the state file as routine cleanup: it contains baselines and pending operations needed for recovery.
+
+The API does not document atomic conditional updates, so a small race remains between the final remote check and a write. Completed tasks already known to the package are fetched individually if absent from project data; this is not a full completed-history import. Reopening completed tasks is currently refused. See [the API constraints and design notes](docs/synchronization.md).
+
+## Development
+
+Install the `request` and `simple-httpd` dependencies, then run `make test`. For dependencies outside the normal Emacs package directories, pass `LOAD_PATH="-L /path/to/request -L /path/to/simple-httpd"`. Tests use temporary Org and state files with a simulated API; they do not access a live TickTick account.

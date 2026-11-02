@@ -193,8 +193,10 @@ After changing this value, call `ticktick-toggle-sync-timer' to apply changes."
 
 (defcustom ticktick-archive-location 'separate-file
   "Where to archive deleted tasks.
-- `separate-file': Archive to a separate file specified by `ticktick-archive-file'
-- `archive-heading': Archive under an \"Archived Tasks\" heading in the sync file"
+- `separate-file': Archive to the file specified by
+  `ticktick-archive-file'
+- `archive-heading': Archive under an \"Archived Tasks\" heading
+  in the sync file"
   :type '(choice (const :tag "Separate archive file" separate-file)
                  (const :tag "Archive heading in sync file" archive-heading))
   :group 'ticktick)
@@ -229,6 +231,9 @@ Deletion timestamps are unavailable, so keep-newest cannot be determined safely.
 
 (defvar ticktick--sync-timer nil
   "Timer object for periodic syncing.")
+
+(defvar ticktick--sync-in-progress nil
+  "Non-nil while synchronization is running in this Emacs.")
 
 ;; --- Token persistence helpers -----------------------------------------------
 
@@ -276,7 +281,9 @@ This is a plist with keys:
 
 (defun ticktick--migrate-state (state)
   "Return STATE upgraded without inventing per-task baselines."
-  (unless (listp state) (error "Invalid TickTick state"))
+  (unless (and (proper-list-p state) (cl-evenp (length state))
+               (cl-loop for (key _value) on state by #'cddr always (keywordp key)))
+    (error "Invalid TickTick state"))
   (when (> (or (plist-get state :version) 1) ticktick--state-version)
     (error "TickTick state was written by a newer package"))
   (dolist (key '(:baselines :pending-operations :conflicts))
@@ -535,7 +542,8 @@ Returns t on success, nil if task not found."
 
 (defun ticktick--confirm-deletion-p (task-id direction)
   "Ask user to confirm deletion of task with TASK-ID.
-DIRECTION is either 'from-org or 'from-api indicating where the task is being deleted from.
+DIRECTION is either `from-org' or `from-api', indicating which side
+originally lost the task.
 Returns t if user confirms, nil otherwise."
   (cond
    ((eq ticktick-delete-behavior 'sync-only)
@@ -749,14 +757,25 @@ Starts local server, requests consent through browser, then captures redirect."
 ;;; Core request ---------------------------------------------------------------
 
 (defun ticktick--parse-json-maybe ()
-  "Parse current buffer as JSON if non-empty; otherwise return nil."
+  "Parse JSON, preserving the distinction between empty task arrays and objects.
+Return nil for an empty response; signal on malformed or trailing JSON."
   (goto-char (point-min))
-  (let ((json-object-type 'plist)
-        (json-array-type 'list)
-        (json-false :false))
-    (if (zerop (buffer-size))
-        nil
-      (json-read))))
+  (skip-chars-forward " \t\r\n")
+  (unless (eobp)
+    (let* ((json-object-type 'plist)
+           (json-array-type 'vector)
+           (json-false :false)
+           (value (json-read)))
+      (skip-chars-forward " \t\r\n")
+      (unless (eobp) (error "Trailing data in TickTick JSON response"))
+      (when (and (listp value) (plist-member value :tasks)
+                 (not (vectorp (plist-get value :tasks))))
+        (error "TickTick task list must be an array"))
+      (cl-labels ((lists (item)
+                    (cond ((vectorp item) (mapcar #'lists (append item nil)))
+                          ((consp item) (cons (lists (car item)) (lists (cdr item))))
+                          (t item))))
+        (lists value)))))
 
 (define-error 'ticktick-api-error "TickTick API request failed")
 
@@ -782,6 +801,11 @@ unauthorized request once after refreshing the token."
           :parser (lambda ()
                     (when (and (string= method "GET") (zerop (buffer-size)))
                       (error "Empty response to TickTick GET request"))
+                    (when (equal endpoint "/open/v1/project")
+                      (goto-char (point-min))
+                      (skip-chars-forward " \t\r\n")
+                      (unless (eq (char-after) ?\[)
+                        (error "TickTick project list must be an array")))
                     (ticktick--parse-json-maybe))
           :sync t
           :success (cl-function
@@ -1069,7 +1093,9 @@ Archive the local copy when configured; respect the sync-only policy."
     (user-error "Use this command in the TickTick sync file"))
   (when (eq ticktick-delete-behavior 'sync-only)
     (user-error "Deletion is disabled by ticktick-delete-behavior"))
-  (let ((id (org-entry-get nil "TICKTICK_ID")))
+  (when ticktick--sync-in-progress (user-error "TickTick sync already running"))
+  (let ((ticktick--sync-in-progress t)
+        (id (org-entry-get nil "TICKTICK_ID")))
     (unless id (user-error "No TickTick task at point"))
     (ticktick--ensure-state-initialized)
     (let* ((local (ticktick--local-record id))
@@ -1088,37 +1114,11 @@ Archive the local copy when configured; respect the sync-only policy."
 
 ;;;###autoload
 (defun ticktick-retry-failed-deletions ()
-  "Retry all failed deletion operations from the state file."
+  "Recheck failed deletions through reconciliation and open their review.
+Never replay an old deletion without comparing current task versions."
   (interactive)
-  (ticktick--load-state)
-  (let ((failed (plist-get ticktick--sync-state :failed-operations)))
-    (if (not failed)
-        (message "No failed operations to retry")
-      (message "Retrying %d failed operation(s)..." (length failed))
-      (let ((retry-count 0)
-            (success-count 0))
-        (dolist (op failed)
-          (setq retry-count (1+ retry-count))
-          (let ((op-type (plist-get op :type))
-                (task-id (plist-get op :task-id)))
-            (condition-case err
-                (progn
-                  (cond
-                   ((eq op-type 'delete-from-api)
-                    (when (ticktick--delete-task-from-api task-id)
-                      (setq success-count (1+ success-count))
-                      (setq failed (delq op failed))))
-                   ((eq op-type 'delete-from-org)
-                    (when (ticktick--delete-task-from-org task-id)
-                      (setq success-count (1+ success-count))
-                      (setq failed (delq op failed))))))
-              (error
-               (message "Failed to retry operation for task %s: %s"
-                       task-id (error-message-string err))))))
-        (setq ticktick--sync-state (plist-put ticktick--sync-state :failed-operations failed))
-        (ticktick--save-state)
-        (message "Retry complete: %d/%d operations succeeded"
-                success-count retry-count)))))
+  (ticktick-sync)
+  (ticktick-review-conflicts))
 
 ;;;###autoload
 (defun ticktick-show-sync-state ()

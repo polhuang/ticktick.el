@@ -102,6 +102,10 @@
                        ((200 . "[]") (500 . ""))
                        ((200 . "[{\"id\":\"work\",\"name\":\"Work\"}]")
                         (200 . "{\"tasks\":[]}") (500 . ""))
+                       ((200 . "{}"))
+                       ((200 . "[] trailing"))
+                       ((200 . "[]") (200 . "{\"tasks\":null}"))
+                       ((200 . "[]") (200 . "{\"tasks\":{}}"))
                        ((200 . "[]") (200 . "{}"))
                        ((200 . "[]") (200 . "{\"tasks\":[{}]}"))))
     (ticktick-test--with-api responses
@@ -375,5 +379,141 @@
       (should (ticktick--local-record "two"))
       (should (equal (plist-get (ticktick--baseline "two") :title) "Edited locally"))
       (should-not (plist-get ticktick--sync-state :pending-operations)))))
+
+(ert-deftest ticktick-field-merge-combines-independent-edits ()
+  (let* ((base (ticktick--snapshot-from-api '(:title "Base" :projectId "inbox" :tags ("work"))))
+         (local (plist-put (copy-tree base) :title "Local title"))
+         (remote (plist-put (copy-tree base) :priority 5))
+         (result (ticktick--merge-snapshots base local remote)))
+    (should-not (plist-get result :conflicting-fields))
+    (should (equal (plist-get (plist-get result :snapshot) :title) "Local title"))
+    (should (= (plist-get (plist-get result :snapshot) :priority) 5))
+    (should (eq (plist-get (ticktick--plan-task (ticktick-test--record local)
+                                              (ticktick-test--record remote) base) :action)
+                'merge))))
+
+(ert-deftest ticktick-field-merge-holds-differing-descriptions-and-tag-lists ()
+  (let* ((base '(:content "Before" :tags ("work")))
+         (local '(:content "Local text" :tags ("work" "local")))
+         (remote '(:content "Remote text" :tags ("work" "remote")))
+         (result (ticktick--merge-snapshots base local remote)))
+    (should (equal (plist-get result :conflicting-fields) '(:content :tags)))
+    (should (eq (plist-get (ticktick--plan-task (ticktick-test--record local)
+                                              (ticktick-test--record remote) base) :action)
+                'conflict))))
+
+(ert-deftest ticktick-sync-merges-independent-edits-through-api-and-org ()
+  (ticktick-test--with-api
+      '((200 . "[]")
+        (200 . "{\"tasks\":[{\"id\":\"one\",\"title\":\"Base\",\"projectId\":\"inbox\",\"priority\":5}]}")
+        (200 . "{\"id\":\"one\",\"title\":\"Base\",\"projectId\":\"inbox\",\"priority\":5}")
+        (200 . "{\"id\":\"one\",\"title\":\"Local title\",\"projectId\":\"inbox\",\"priority\":5}")
+        (200 . "{\"id\":\"one\",\"title\":\"Local title\",\"projectId\":\"inbox\",\"priority\":5}"))
+    (setq ticktick--sync-state (ticktick--migrate-state nil))
+    (let ((record (ticktick-test--seed-task "Base")))
+      (ticktick--set-baseline "one" (plist-get record :snapshot))
+      (with-current-buffer (find-file-noselect ticktick-sync-file)
+        (goto-char (plist-get record :position))
+        (org-edit-headline "Local title")))
+    (ticktick-sync)
+    (should-not (plist-get ticktick--sync-state :conflicts))
+    (should-not (plist-get ticktick--sync-state :pending-operations))
+    (should (equal (ticktick--baseline "one") (plist-get (ticktick--local-record "one") :snapshot)))
+    (should (equal (plist-get (ticktick--baseline "one") :title) "Local title"))
+    (should (= (plist-get (ticktick--baseline "one") :priority) 5))
+    (should (= 1 (cl-count "POST" ticktick-test--requests
+                          :key (lambda (r) (plist-get (cadr r) :type)) :test #'equal)))))
+
+(ert-deftest ticktick-org-roundtrip-preserves-deadline-seconds ()
+  (ticktick-test--with-api nil
+    (let* ((snapshot (ticktick--snapshot-from-api
+                      '(:title "Precise" :projectId "inbox" :isAllDay :false
+                        :dueDate "2026-11-06T13:30:45Z" :timeZone "Europe/Helsinki"))))
+      (ticktick--write-local-snapshot "one" "one" snapshot)
+      (should (equal snapshot (plist-get (ticktick--local-record "one") :snapshot))))))
+
+(ert-deftest ticktick-known-creation-id-is-not-imported-as-a-duplicate ()
+  (ticktick-test--with-api
+      '((200 . "[]") (200 . "{\"tasks\":[]}") (200 . "{\"id\":\"one\"}")
+        (200 . "{\"id\":\"one\",\"title\":\"Server edit\",\"projectId\":\"inbox\"}")
+        (200 . "[]")
+        (200 . "{\"tasks\":[{\"id\":\"one\",\"title\":\"Server edit\",\"projectId\":\"inbox\"}]}")
+        (200 . "{\"id\":\"one\",\"title\":\"Server edit\",\"projectId\":\"inbox\"}")
+        (200 . "{\"id\":\"one\",\"title\":\"Server edit\",\"projectId\":\"inbox\"}"))
+    (setq ticktick--sync-state (ticktick--migrate-state nil))
+    (with-current-buffer (find-file-noselect ticktick-sync-file)
+      (org-mode)
+      (insert "* Inbox\n:PROPERTIES:\n:TICKTICK_PROJECT_ID: inbox\n:END:\n** TODO New\n")
+      (save-buffer))
+    (ticktick-sync)
+    (ticktick-sync)
+    (should (= 1 (length (ticktick--collect-local-records))))
+    (should (= 1 (length (plist-get ticktick--sync-state :conflicts))))
+    (let ((key (plist-get (car (plist-get ticktick--sync-state :conflicts)) :key)))
+      (ticktick-resolve-conflict key 'ticktick))
+    (should (= 1 (length (ticktick--collect-local-records))))
+    (should (equal (plist-get (ticktick--baseline "one") :title) "Server edit"))
+    (should-not (plist-get ticktick--sync-state :pending-operations))))
+
+(ert-deftest ticktick-baseline-does-not-advance-if-state-save-fails ()
+  (ticktick-test--with-api nil
+    (ticktick--set-baseline "one" '(:title "Before"))
+    (ticktick--journal-put '(:key "one" :phase remote-applied))
+    (cl-letf (((symbol-function 'ticktick--save-state) (lambda () (error "Disk full"))))
+      (should-error (ticktick--finish-operation '(:key "one") "one" '(:title "After"))))
+    (should (equal (ticktick--baseline "one") '(:title "Before")))
+    (should (plist-get ticktick--sync-state :pending-operations))))
+
+(ert-deftest ticktick-resolution-refuses-to-run-during-another-sync ()
+  (let ((ticktick--sync-in-progress t))
+    (should-error (ticktick-resolve-conflict "one" 'org) :type 'user-error)
+    (should-error (ticktick-link-pending-creation "one" "two") :type 'user-error)))
+
+(ert-deftest ticktick-create-accepts-server-default-zone-and-preserves-it ()
+  (ticktick-test--with-api
+      '((200 . "{\"id\":\"one\"}")
+        (200 . "{\"id\":\"one\",\"projectId\":\"inbox\",\"title\":\"New\",\"dueDate\":\"2026-11-06T00:00:00Z\",\"isAllDay\":true,\"timeZone\":\"UTC\"}"))
+    (setq ticktick--sync-state (ticktick--migrate-state nil))
+    (let ((target (ticktick--snapshot-from-api
+                   '(:title "New" :projectId "inbox" :isAllDay t :dueDate "2026-11-06T00:00:00Z"))))
+      (ticktick--write-local-snapshot "new" nil target)
+      (ticktick--execute-operation
+       (ticktick--plan-task (car (ticktick--collect-local-records)) nil nil))
+      (should (equal (plist-get (plist-get (ticktick--baseline "one") :deadline) :time-zone) "UTC"))
+      (should (equal (ticktick--baseline "one") (plist-get (ticktick--local-record "one") :snapshot))))))
+
+(ert-deftest ticktick-pending-delete-does-not-recover-through-an-inaccessible-project ()
+  (ticktick-test--with-api nil
+    (let* ((local (ticktick-test--seed-task "Keep"))
+           (operation (list :id "one" :key "one" :target nil :action 'delete-local
+                            :local (plist-get local :snapshot))))
+      (ticktick--journal-put operation)
+      (ticktick--recover-pending (list local) '((:id "one" :key "one" :unknown t)))
+      (should (ticktick--local-record "one"))
+      (should (plist-get ticktick--sync-state :pending-operations)))))
+
+(ert-deftest ticktick-pending-creation-remains-reviewable-after-local-deletion ()
+  (let ((ticktick--sync-state
+         '(:pending-operations ((:key "pending" :action create :target (:title "New"))))))
+    (let ((plan (ticktick--build-plan nil nil)))
+      (should (= 1 (length plan)))
+      (should (equal (plist-get (car plan) :key) "pending"))
+      (should-not (plist-get (car plan) :id)))))
+
+(ert-deftest ticktick-reviewed-snapshot-is-not-replaced-by-background-refresh ()
+  (ticktick-test--with-api nil
+    (let* ((local (ticktick-test--seed-task "First local edit"))
+           (remote (ticktick-test--record '(:title "Remote")))
+           (reviewed (ticktick--plan-task local remote nil)))
+      (with-current-buffer (find-file-noselect ticktick-sync-file)
+        (goto-char (plist-get local :position))
+        (org-edit-headline "Second local edit"))
+      ;; Autosync has replaced the persisted conflict, but the open UI still
+      ;; shows the previous versions.  Resolve against those reviewed versions.
+      (setq ticktick--sync-state
+            (plist-put ticktick--sync-state :conflicts
+                       (list (ticktick--plan-task (ticktick--local-record "one") remote nil))))
+      (should-error (ticktick-resolve-conflict "one" 'ticktick nil reviewed))
+      (should-not ticktick-test--requests))))
 
 ;;; ticktick-test.el ends here

@@ -24,3 +24,14 @@ A task baseline advances only after the local file is saved and the remote state
 Unambiguous deletions follow `ticktick-delete-behavior`. `delete` applies them automatically; `archive` archives local removals (and requires review if `ticktick-confirm-deletions` is non-nil); `ask` queues them in the conflict review instead of prompting during background work. `sync-only` leaves them pending review and preserves their baselines. An explicit review choice can authorize a deletion.
 
 Delete-versus-edit cases always require review. The legacy `ticktick-deletion-conflict-policy` variable is retained for configuration compatibility, but is not used to guess the newest action: the API provides no reliable deletion timestamp. Keeping a locally edited task after remote deletion creates a new remote task and replaces its old ID only after verification. Archived headings retain their metadata and are excluded from active synchronization.
+
+
+## Baselines, merging, and recovery
+
+Version 2 state stores normalized per-task baselines, pending operations, and review records. Legacy state retains its ID history but does not invent snapshots. Equal copies can establish a baseline; differing copies require review.
+
+For each field, choose the changed side if the other still matches the baseline, accept identical edits, and record conflicting fields if both changed differently. Project, title, content, status, priority, deadline details, and tags participate in this comparison. Descriptions and tag lists are not text-merged. Hold the entire task when any field conflicts. Pull-only and push-only commands defer merges that require writing both sides.
+
+Before each mutation, check local and remote versions again and save intent atomically. Preserve remote recurrence, reminders, start dates, and checklist data when updating supported fields. Verify remote results, save the Org task, and only then advance its baseline. A journal entry with a returned creation ID remains paired with its original Org heading, even if verification fails, so it cannot become a duplicate import.
+
+Recovery completes operations only when their observed state matches the intended result and the local task is unchanged or already reconciled. Changed sources remain available for explicit review. Baseline writes roll back in memory if state persistence fails. An uncertain creation without a returned ID must be linked or explicitly released after manual verification; never guess by matching a title.
