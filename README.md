@@ -135,6 +135,25 @@ Task description content here.
 (setq ticktick-httpd-port 8080)
 ```
 
+### Project-specific Org files
+
+Map TickTick project IDs to Org files with `ticktick-project-files`:
+
+```elisp
+(setq ticktick-project-files
+      '(("your-work-project-id" . "~/org/work.org")
+        ("your-personal-project-id" . "~/org/personal.org")
+        ("inbox" . "~/org/inbox.org")))
+```
+
+Find a project's ID in its `TICKTICK_PROJECT_ID` property after an initial sync. Keys are IDs, not list names, so renaming a list does not change its destination. Use `"inbox"` for Inbox. Projects without a mapping continue to use `ticktick-sync-file`. Relative file paths are resolved under `ticktick-dir`.
+
+Run `M-x ticktick-sync` to apply the mapping. Missing files and parent directories are created when a task is written. The file retains the usual structure: a top-level project heading with `TICKTICK_PROJECT_ID`, followed by second-level task headings. Multiple projects can share one file. Unrelated headings outside TickTick project subtrees are ignored.
+
+Existing tasks move to the configured destination on sync, preserving their IDs and properties. The state file remembers old destinations, so changing or removing a mapping relocates tasks instead of treating them as deleted. File moves save the destination before removing the source and can recover after an interrupted save. If either copy was edited during an interrupted move, synchronization stops and identifies both files for inspection.
+
+All configured and remembered files participate in pushing, conflict review, deletion, and automatic syncing. When archiving under an `Archived Tasks` heading, the archive stays in the task's source file; the separate-file archive setting still uses `ticktick-archive-file`. Tokens and synchronization state remain under `ticktick-dir`.
+
 ### Automatic Syncing
 
 Enable automatic syncing with one of these methods:

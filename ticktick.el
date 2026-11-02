@@ -91,7 +91,8 @@
 ;; CUSTOMIZATION:
 ;;
 ;; Key variables you can customize:
-;; - `ticktick-sync-file': Path to the org file for tasks
+;; - `ticktick-sync-file': Default Org file for tasks
+;; - `ticktick-project-files': Optional project ID to Org file mappings
 ;; - `ticktick-dir': Directory for storing tokens and data
 ;; - `ticktick-autosync': Enable automatic syncing on focus changes
 ;; - `ticktick-sync-interval': Enable automatic syncing every N minutes
@@ -151,10 +152,20 @@
   :group 'ticktick)
 
 (defcustom ticktick-sync-file (expand-file-name "ticktick.org" ticktick-dir)
-  "Path to the org file where all TickTick tasks will be synchronized."
+  "Default Org destination for projects absent from `ticktick-project-files'."
   :type 'file
   :group 'ticktick)
 
+
+(defcustom ticktick-project-files nil
+  "Alist mapping TickTick project IDs to destination Org files.
+Use `inbox' for Inbox.  Unmapped projects use `ticktick-sync-file'.
+Relative paths are resolved under `ticktick-dir'.  Files and parent directories
+are created when tasks are written.  Existing tasks are relocated on sync,
+retaining their IDs and unrelated properties.  Each file uses project headings."
+  :type '(alist :key-type (string :tag "Project ID")
+                :value-type (file :tag "Org file"))
+  :group 'ticktick)
 
 (defcustom ticktick-autosync nil
   "If non-nil, automatically sync when switching buffers or losing focus."
@@ -276,7 +287,7 @@ This is a plist with keys:
   "Return the path to the state file."
   (expand-file-name ".ticktick-state.el" ticktick-dir))
 
-(defconst ticktick--state-version 2
+(defconst ticktick--state-version 3
   "Current synchronization state schema version.")
 
 (defun ticktick--migrate-state (state)
@@ -286,7 +297,7 @@ This is a plist with keys:
     (error "Invalid TickTick state"))
   (when (> (or (plist-get state :version) 1) ticktick--state-version)
     (error "TickTick state was written by a newer package"))
-  (dolist (key '(:baselines :pending-operations :conflicts))
+  (dolist (key '(:baselines :pending-operations :conflicts :sync-files :file-moves))
     (unless (plist-member state key)
       (setq state (plist-put state key nil))))
   (plist-put state :version ticktick--state-version))
@@ -314,16 +325,9 @@ This is a plist with keys:
         (when (file-exists-p temporary) (delete-file temporary))))))
 
 (defun ticktick--collect-org-task-ids ()
-  "Scan the org sync file and return a list of all TICKTICK_ID values."
-  (let ((task-ids nil))
-    (with-current-buffer (find-file-noselect ticktick-sync-file)
-      (org-with-wide-buffer
-       (goto-char (point-min))
-       (while (re-search-forward "^:TICKTICK_ID: \\(.+\\)$" nil t)
-         (let ((id (match-string 1)))
-           (when (and id (not (string-empty-p id)))
-             (push id task-ids))))))
-    (nreverse task-ids)))
+  "Return active TickTick task IDs across the configured Org files."
+  (delq nil (mapcar (lambda (record) (plist-get record :id))
+                   (ticktick--collect-local-records))))
 
 (defun ticktick--fetch-project-data (project)
   "Fetch PROJECT data, signaling an error if the task list is unavailable."
@@ -347,19 +351,10 @@ This is a plist with keys:
     (nreverse task-ids)))
 
 (defun ticktick--collect-task-project-map ()
-  "Scan the org file and return an alist of (TASK-ID . PROJECT-ID) pairs."
-  (let ((map nil))
-    (with-current-buffer (find-file-noselect ticktick-sync-file)
-      (org-with-wide-buffer
-       (goto-char (point-min))
-       (while (outline-next-heading)
-         (when (= (org-current-level) 2)
-           (let ((task-id (org-entry-get nil "TICKTICK_ID"))
-                 (project-id (org-entry-get nil "TICKTICK_PROJECT_ID" t)))
-             (when (and task-id (not (string-empty-p task-id))
-                       project-id (not (string-empty-p project-id)))
-               (push (cons task-id project-id) map)))))))
-    (nreverse map)))
+  "Return active task IDs and project IDs across configured Org files."
+  (cl-loop for record in (ticktick--collect-local-records)
+           for id = (plist-get record :id)
+           when id collect (cons id (plist-get (plist-get record :snapshot) :project-id))))
 
 (defun ticktick--ensure-state-initialized ()
   "Initialize the state file if it doesn't exist or is empty."
@@ -400,16 +395,8 @@ Returns a list of deleted task IDs."
       (cl-set-difference previous-ids current-ids :test #'string=))))
 
 (defun ticktick--find-task-by-id-in-org (task-id)
-  "Find and return the position of task with TASK-ID in org file.
-Returns nil if not found."
-  (with-current-buffer (find-file-noselect ticktick-sync-file)
-    (org-with-wide-buffer
-     (goto-char (point-min))
-     (catch 'found
-       (while (re-search-forward (format "^:TICKTICK_ID: %s$" (regexp-quote task-id)) nil t)
-         (org-back-to-heading t)
-         (throw 'found (point)))
-       nil))))
+  "Return task TASK-ID's position; use `ticktick--get-task-info' for its file."
+  (plist-get (ticktick--local-record task-id) :position))
 
 (defun ticktick--get-cached-project-id (task-id)
   "Get the project ID for TASK-ID from the cached task-project map."
@@ -417,17 +404,12 @@ Returns nil if not found."
     (cdr (assoc task-id map))))
 
 (defun ticktick--get-task-info (task-id)
-  "Get task information for TASK-ID from org file.
-Returns a plist with :title, :project-id, and :position, or nil if not found."
-  (let ((pos (ticktick--find-task-by-id-in-org task-id)))
-    (when pos
-      (with-current-buffer (find-file-noselect ticktick-sync-file)
-        (org-with-wide-buffer
-         (goto-char pos)
-         (let ((el (org-element-at-point)))
-           (list :title (org-element-property :raw-value el)
-                 :project-id (org-entry-get nil "TICKTICK_PROJECT_ID" t)
-                 :position pos)))))))
+  "Return TASK-ID's :title, :project-id, :position, and :file."
+  (let ((record (ticktick--local-record task-id)))
+    (when record
+      (list :title (plist-get (plist-get record :snapshot) :title)
+            :project-id (plist-get (plist-get record :snapshot) :project-id)
+            :position (plist-get record :position) :file (plist-get record :file)))))
 
 ;;; Deletion execution ---------------------------------------------------------
 
@@ -459,86 +441,10 @@ Returns t on success, nil on failure."
      nil)))
 
 (defun ticktick--delete-task-from-org (task-id)
-  "Delete task with TASK-ID from org file.
-Behavior depends on `ticktick-delete-behavior'.
-Returns t on success, nil if task not found."
-  (let ((pos (ticktick--find-task-by-id-in-org task-id)))
-    (if (not pos)
-        (progn
-          (message "Task %s not found in org file" task-id)
-          nil)
-      (with-current-buffer (find-file-noselect ticktick-sync-file)
-        (org-with-wide-buffer
-         (goto-char pos)
-         (let ((task-info (ticktick--get-task-info task-id)))
-           (cond
-            ((eq ticktick-delete-behavior 'archive)
-             (ticktick--archive-task task-id task-info))
-            (t
-             ;; Hard delete
-             (delete-region (org-entry-beginning-position)
-                           (org-entry-end-position))
-             (message "Deleted task '%s' from org file"
-                     (plist-get task-info :title)))))
-         (save-buffer))
-        t))))
-
-(defun ticktick--archive-task (task-id task-info)
-  "Archive task with TASK-ID and TASK-INFO to the configured archive location."
-  (let ((task-title (plist-get task-info :title))
-        (task-content (save-excursion
-                        (goto-char (plist-get task-info :position))
-                        (buffer-substring-no-properties
-                         (org-entry-beginning-position)
-                         (org-entry-end-position)))))
-    (cond
-     ((eq ticktick-archive-location 'separate-file)
-      ;; Archive to separate file
-      (ticktick--ensure-dir)
-      (with-current-buffer (find-file-noselect ticktick-archive-file)
-        (goto-char (point-max))
-        (unless (bolp) (insert "\n"))
-        (insert "* ARCHIVED " task-title "\n")
-        (insert ":PROPERTIES:\n")
-        (insert (format ":ARCHIVED_AT: [%s]\n"
-                       (format-time-string "%F %a %H:%M")))
-        (insert (format ":ARCHIVED_REASON: Deleted in TickTick\n"))
-        (insert (format ":TICKTICK_ID: %s\n" task-id))
-        (insert ":END:\n")
-        ;; Copy the original task content (excluding the heading line)
-        (let ((lines (split-string task-content "\n")))
-          (dolist (line (cdr lines))
-            (unless (string-match-p "^:PROPERTIES:" line)
-              (insert line "\n"))))
-        (save-buffer)))
-     ((eq ticktick-archive-location 'archive-heading)
-      ;; Archive under "Archived Tasks" heading in sync file
-      (with-current-buffer (find-file-noselect ticktick-sync-file)
-        (org-with-wide-buffer
-         (goto-char (point-min))
-         (unless (re-search-forward "^\\* Archived Tasks$" nil t)
-           ;; Create archive heading if it doesn't exist
-           (goto-char (point-max))
-           (unless (bolp) (insert "\n"))
-           (insert "* Archived Tasks\n"))
-         (goto-char (match-end 0))
-         (forward-line)
-         (insert task-content)
-         (insert "\n")
-         ;; Add archive metadata
-         (org-back-to-heading t)
-         (org-set-property "ARCHIVED_AT"
-                          (format-time-string "[%F %a %H:%M]"))
-         (org-set-property "ARCHIVED_REASON" "Deleted in TickTick")
-         (save-buffer)))))
-    ;; Delete original task from sync file
-    (with-current-buffer (find-file-noselect ticktick-sync-file)
-      (org-with-wide-buffer
-       (goto-char (plist-get task-info :position))
-       (delete-region (org-entry-beginning-position)
-                     (org-entry-end-position))
-       (save-buffer)))
-    (message "Archived task '%s'" task-title)))
+  "Remove or archive TASK-ID from its actual Org file."
+  (when (ticktick--local-record task-id)
+    (ticktick--remove-local-task task-id)
+    t))
 
 (defun ticktick--confirm-deletion-p (task-id direction)
   "Ask user to confirm deletion of task with TASK-ID.
@@ -1016,7 +922,7 @@ Return the buffer position at the start of the heading."
 (defun ticktick--autosync ()
   "Autosync if enabled."
   (when ticktick-autosync
-    (when (file-exists-p ticktick-sync-file)
+    (when (ticktick--sync-files-present-p)
       (ignore-errors (ticktick-sync)))))
 
 (defun ticktick--setup-sync-timer ()
@@ -1034,7 +940,7 @@ Return the buffer position at the start of the heading."
 
 (defun ticktick--timer-sync ()
   "Sync function called by timer."
-  (when (file-exists-p ticktick-sync-file)
+  (when (ticktick--sync-files-present-p)
     (ignore-errors (ticktick-sync))))
 
 ;;;###autoload
@@ -1089,8 +995,8 @@ Return the buffer position at the start of the heading."
 Archive the local copy when configured; respect the sync-only policy."
   (interactive)
   (unless (and (derived-mode-p 'org-mode) buffer-file-name
-               (file-equal-p buffer-file-name ticktick-sync-file))
-    (user-error "Use this command in the TickTick sync file"))
+               (member (ticktick--canonical-sync-file buffer-file-name) (ticktick--sync-files)))
+    (user-error "Use this command in a TickTick sync file"))
   (when (eq ticktick-delete-behavior 'sync-only)
     (user-error "Deletion is disabled by ticktick-delete-behavior"))
   (when ticktick--sync-in-progress (user-error "TickTick sync already running"))

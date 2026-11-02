@@ -28,10 +28,19 @@ Delete-versus-edit cases always require review. The legacy `ticktick-deletion-co
 
 ## Baselines, merging, and recovery
 
-Version 2 state stores normalized per-task baselines, pending operations, and review records. Legacy state retains its ID history but does not invent snapshots. Equal copies can establish a baseline; differing copies require review.
+Version 3 state stores normalized per-task baselines, pending operations, and review records. Legacy state retains its ID history but does not invent snapshots. Equal copies can establish a baseline; differing copies require review.
 
 For each field, choose the changed side if the other still matches the baseline, accept identical edits, and record conflicting fields if both changed differently. Project, title, content, status, priority, deadline details, and tags participate in this comparison. Descriptions and tag lists are not text-merged. Hold the entire task when any field conflicts. Pull-only and push-only commands defer merges that require writing both sides.
 
 Before each mutation, check local and remote versions again and save intent atomically. Preserve remote recurrence, reminders, start dates, and checklist data when updating supported fields. Verify remote results, save the Org task, and only then advance its baseline. A journal entry with a returned creation ID remains paired with its original Org heading, even if verification fails, so it cannot become a duplicate import.
 
 Recovery completes operations only when their observed state matches the intended result and the local task is unchanged or already reconciled. Changed sources remain available for explicit review. Baseline writes roll back in memory if state persistence fails. An uncertain creation without a returned ID must be linked or explicitly released after manual verification; never guess by matching a title.
+
+
+## Project file routing
+
+`ticktick-project-files` maps stable project IDs (including `inbox`) to files; other projects use `ticktick-sync-file`. Relative destinations resolve under `ticktick-dir`, and canonical paths prevent aliases from being scanned twice. Active task records include their source file. Only second-level tasks under a `TICKTICK_PROJECT_ID` heading participate; an identified task missing its project fails validation instead of silently becoming a deletion.
+
+All configured and previously used paths are scanned together, with duplicate task IDs rejected before remote writes. Remembered destinations allow mapping changes to migrate existing tasks. Files and their parent directories are created on writes; preview scans do not create them. Baselines and pending operations remain centralized in the existing state file.
+
+Cross-file moves have a separate durable journal containing the original subtree and both paths. Save the destination, verify both copies against the original, and only then remove and save the source. Recovery runs before scanning for duplicate IDs, so a restart between the two saves can finish the move. If either copy changed, halt for inspection instead of guessing which one to delete. A mapping-only move preserves the entire subtree and does not update the remote task.

@@ -32,6 +32,7 @@
           (ticktick-test--requests nil)
           (ticktick-dir (make-temp-file "ticktick-test-" t))
           (ticktick-sync-file (expand-file-name "tasks.org" ticktick-dir))
+          (ticktick-project-files nil)
           (ticktick-archive-file (expand-file-name "archive.org" ticktick-dir))
           (ticktick-token '(:access_token "test"))
           (ticktick--sync-state (copy-tree '(:api-task-ids ("existing") :last-sync-time "before"))))
@@ -515,5 +516,192 @@
                        (list (ticktick--plan-task (ticktick--local-record "one") remote nil))))
       (should-error (ticktick-resolve-conflict "one" 'ticktick nil reviewed))
       (should-not ticktick-test--requests))))
+
+(ert-deftest ticktick-project-file-import-creates-file-and-parent-directories ()
+  (ticktick-test--with-api
+      '((200 . "[{\"id\":\"work\",\"name\":\"Work\"}]")
+        (200 . "{\"tasks\":[]}")
+        (200 . "{\"tasks\":[{\"id\":\"one\",\"title\":\"Imported\",\"projectId\":\"work\"}]}")
+        (200 . "{\"id\":\"one\",\"title\":\"Imported\",\"projectId\":\"work\"}"))
+    (setq ticktick--sync-state (ticktick--migrate-state nil))
+    (let* ((ticktick-project-files '(("work" . "projects/work.org")))
+           (destination (expand-file-name "projects/work.org" ticktick-dir)))
+      (ticktick-sync)
+      (should (file-exists-p destination))
+      (should-not (file-exists-p ticktick-sync-file))
+      (should (equal (plist-get (ticktick--local-record "one") :file)
+                     (file-truename destination)))
+      (should (equal (plist-get (ticktick--baseline "one") :project-id) "work"))
+      (with-temp-buffer
+        (insert-file-contents destination)
+        (should (search-forward "* Work" nil t)))
+      (should-not (plist-get ticktick--sync-state :conflicts)))))
+
+(ert-deftest ticktick-project-files-scan-all-files-and-ignore-unrelated-headings ()
+  (ticktick-test--with-api nil
+    (let ((ticktick-project-files '(("inbox" . "inbox.org") ("work" . "work.org"))))
+      (dolist (file '("inbox.org" "work.org"))
+        (with-temp-file (expand-file-name file ticktick-dir)
+          (insert "* Notes\n** Unrelated heading\nSome notes.\n"
+                  "* Project\n:PROPERTIES:\n:TICKTICK_PROJECT_ID: " file
+                  "\n:END:\n** TODO New task\n")))
+      (let ((records (ticktick--collect-local-records)))
+        (should (= 2 (length records)))
+        (should-not (equal (plist-get (car records) :key) (plist-get (cadr records) :key)))))))
+
+(ert-deftest ticktick-project-remapping-moves-an-unchanged-task-without-api-write ()
+  (ticktick-test--with-api
+      '((200 . "[]")
+        (200 . "{\"tasks\":[{\"id\":\"one\",\"title\":\"Keep metadata\",\"projectId\":\"inbox\"}]}")
+        (200 . "{\"id\":\"one\",\"title\":\"Keep metadata\",\"projectId\":\"inbox\"}"))
+    (setq ticktick--sync-state (ticktick--migrate-state nil))
+    (let* ((record (ticktick-test--seed-task "Keep metadata"))
+           (ticktick-project-files '(("inbox" . "nested/inbox.org"))))
+      (ticktick--set-baseline "one" (plist-get record :snapshot))
+      (ticktick-sync)
+      (should (= 1 (length (ticktick--collect-local-records))))
+      (should-not (ticktick--record-in-file (file-truename ticktick-sync-file) "one"))
+      (let ((moved (ticktick--local-record "one")))
+        (should (equal (plist-get moved :file) (ticktick--project-file "inbox")))
+        (with-current-buffer (ticktick--org-buffer (plist-get moved :file))
+          (goto-char (plist-get moved :position))
+          (should (equal (org-entry-get nil "CUSTOM") "keep"))))
+      (should-not (plist-get ticktick--sync-state :file-moves))
+      (should-not (plist-get ticktick--sync-state :conflicts))
+      (dolist (request ticktick-test--requests)
+        (should (equal (plist-get (cadr request) :type) "GET"))))))
+
+(ert-deftest ticktick-project-remapping-remembers-the-previous-destination ()
+  (ticktick-test--with-api nil
+    (setq ticktick--sync-state (ticktick--migrate-state nil))
+    (let ((snapshot (ticktick--snapshot-from-api '(:title "Keep" :projectId "inbox"))))
+      (let ((ticktick-project-files '(("inbox" . "old.org"))))
+        (ticktick--write-local-snapshot "one" "one" snapshot))
+      (let ((ticktick-project-files '(("inbox" . "new.org"))))
+        (should (ticktick--local-record "one"))
+        (ticktick--write-local-snapshot "one" "one" snapshot)
+        (should-not (ticktick--record-in-file (expand-file-name "old.org" ticktick-dir) "one"))
+        (should (equal (plist-get (ticktick--local-record "one") :file)
+                       (ticktick--project-file "inbox")))))))
+
+(ert-deftest ticktick-project-file-move-recovers-after-source-save-failure ()
+  (ticktick-test--with-api nil
+    (setq ticktick--sync-state (ticktick--migrate-state nil))
+    (let* ((record (ticktick-test--seed-task "Recover"))
+           (ticktick-project-files '(("inbox" . "routed.org")))
+           (source (file-truename ticktick-sync-file))
+           (save (symbol-function 'save-buffer)))
+      (cl-letf (((symbol-function 'save-buffer)
+                 (lambda (&rest args)
+                   (if (equal (file-truename buffer-file-name) source)
+                       (error "Simulated source write failure")
+                     (apply save args)))))
+        (should-error (ticktick--write-local-snapshot "one" "one" (plist-get record :snapshot))))
+      (should (plist-get ticktick--sync-state :file-moves))
+      ;; Restart with disk contents: both copies exist until move recovery.
+      (dolist (file (ticktick--sync-files))
+        (let ((buffer (find-buffer-visiting file)))
+          (when buffer
+            (with-current-buffer buffer (set-buffer-modified-p nil))
+            (kill-buffer buffer))))
+      (setq ticktick--sync-state nil)
+      (ticktick--load-state)
+      (ticktick--recover-file-moves)
+      (should (= 1 (length (ticktick--collect-local-records))))
+      (should (equal (plist-get (ticktick--local-record "one") :file)
+                     (ticktick--project-file "inbox")))
+      (should-not (plist-get ticktick--sync-state :file-moves)))))
+
+(ert-deftest ticktick-project-file-archive-stays-in-the-task-source-file ()
+  (ticktick-test--with-api nil
+    (let* ((ticktick-project-files '(("inbox" . "inbox.org")))
+           (ticktick-delete-behavior 'archive)
+           (ticktick-archive-location 'archive-heading)
+           (snapshot (ticktick--snapshot-from-api '(:title "Archive me" :projectId "inbox"))))
+      (ticktick--write-local-snapshot "one" "one" snapshot)
+      (ticktick--remove-local-task "one")
+      (should-not (ticktick--local-record "one"))
+      (should-not (file-exists-p ticktick-sync-file))
+      (with-temp-buffer
+        (insert-file-contents (ticktick--project-file "inbox"))
+        (should (search-forward "* Archived Tasks" nil t))
+        (should (search-forward ":ARCHIVED_AT:" nil t))))))
+
+(ert-deftest ticktick-project-file-new-task-push-uses-its-source-file ()
+  (ticktick-test--with-api
+      '((200 . "[]") (200 . "{\"tasks\":[]}") (200 . "{\"id\":\"one\"}")
+        (200 . "{\"id\":\"one\",\"title\":\"New in inbox\",\"projectId\":\"inbox\"}"))
+    (setq ticktick--sync-state (ticktick--migrate-state nil))
+    (let ((ticktick-project-files '(("inbox" . "inbox.org"))))
+      (with-temp-file (ticktick--project-file "inbox")
+        (insert "* Inbox\n:PROPERTIES:\n:TICKTICK_PROJECT_ID: inbox\n:END:\n** TODO New in inbox\n"))
+      (ticktick-sync)
+      (should (equal (plist-get (ticktick--local-record "one") :file)
+                     (ticktick--project-file "inbox")))
+      (should (equal (plist-get (ticktick--baseline "one") :title) "New in inbox"))
+      (should-not (file-exists-p ticktick-sync-file))
+      (should-not (plist-get ticktick--sync-state :conflicts)))))
+
+(ert-deftest ticktick-project-file-delete-command-uses-the-task-file ()
+  (ticktick-test--with-api
+      '((200 . "{\"id\":\"one\",\"title\":\"Delete me\",\"projectId\":\"inbox\"}")
+        (200 . "{\"id\":\"one\",\"title\":\"Delete me\",\"projectId\":\"inbox\"}")
+        (204 . "") (404 . ""))
+    (let ((ticktick-project-files '(("inbox" . "inbox.org")))
+          (ticktick-delete-behavior 'delete))
+      (ticktick--write-local-snapshot "one" "one"
+                                      (ticktick--snapshot-from-api '(:title "Delete me" :projectId "inbox")))
+      (with-current-buffer (ticktick--org-buffer (ticktick--project-file "inbox"))
+        (goto-char (plist-get (ticktick--local-record "one") :position))
+        (ticktick-delete-task-at-point))
+      (should-not (ticktick--local-record "one"))
+      (should-not (ticktick--baseline "one"))
+      (should-not (file-exists-p ticktick-sync-file)))))
+
+(ert-deftest ticktick-project-file-aliases-do-not-create-duplicate-records ()
+  (ticktick-test--with-api nil
+    (ticktick-test--seed-task "One copy")
+    (let ((ticktick-project-files `(("inbox" . ,ticktick-sync-file))))
+      (should (= 1 (length (ticktick--collect-local-records)))))))
+
+(ert-deftest ticktick-project-file-scanning-rejects-an-orphaned-synced-task ()
+  (ticktick-test--with-api nil
+    (with-temp-file ticktick-sync-file
+      (insert "* Notes\n** TODO Orphan\n:PROPERTIES:\n:TICKTICK_ID: one\n:END:\n"))
+    (should-error (ticktick--collect-local-records))))
+
+(ert-deftest ticktick-project-file-import-preserves-existing-notes ()
+  (ticktick-test--with-api nil
+    (let ((ticktick-project-files '(("inbox" . "notes.org"))))
+      (with-temp-file (ticktick--project-file "inbox")
+        (insert "* Notes\n** Personal notes\nKeep this text.\n"))
+      (ticktick--write-local-snapshot "one" "one"
+                                      (ticktick--snapshot-from-api '(:title "Imported" :projectId "inbox")))
+      (with-temp-buffer
+        (insert-file-contents (ticktick--project-file "inbox"))
+        (should (search-forward "* Notes\n** Personal notes\nKeep this text.\n" nil t)))
+      (should (= 1 (length (ticktick--collect-local-records)))))))
+
+(ert-deftest ticktick-project-file-sharing-keeps-projects-separate ()
+  (ticktick-test--with-api nil
+    (let ((ticktick-project-files '(("inbox" . "shared.org") ("work" . "shared.org"))))
+      (ticktick--write-local-snapshot "one" "one"
+                                      (ticktick--snapshot-from-api '(:title "Inbox task" :projectId "inbox")))
+      (ticktick--write-local-snapshot "two" "two"
+                                      (ticktick--snapshot-from-api '(:title "Work task" :projectId "work")))
+      (should (= 2 (length (ticktick--collect-local-records))))
+      (should (equal (plist-get (plist-get (ticktick--local-record "one") :snapshot) :project-id) "inbox"))
+      (should (equal (plist-get (plist-get (ticktick--local-record "two") :snapshot) :project-id) "work")))))
+
+(ert-deftest ticktick-project-change-routes-a-task-to-its-new-project-file ()
+  (ticktick-test--with-api nil
+    (let* ((record (ticktick-test--seed-task "Move to work"))
+           (ticktick-project-files '(("work" . "work.org")))
+           (target (plist-put (copy-tree (plist-get record :snapshot)) :project-id "work")))
+      (ticktick--write-local-snapshot "one" "one" target "Work")
+      (should (= 1 (length (ticktick--collect-local-records))))
+      (should (equal (plist-get (ticktick--local-record "one") :file)
+                     (ticktick--project-file "work")))
+      (should (equal (plist-get (ticktick--local-record "one") :snapshot) target)))))
 
 ;;; ticktick-test.el ends here

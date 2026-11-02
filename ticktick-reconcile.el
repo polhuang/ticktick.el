@@ -18,6 +18,8 @@
 (defvar ticktick--sync-in-progress nil
   "Non-nil while reconciliation is running in this Emacs.")
 (defvar ticktick-sync-file)
+(defvar ticktick-project-files)
+(defvar ticktick-dir)
 (defvar ticktick-delete-behavior)
 (defvar ticktick-confirm-deletions)
 (defvar ticktick-archive-location)
@@ -114,23 +116,79 @@
     (setq ticktick--sync-state
           (plist-put ticktick--sync-state :baselines baselines))))
 
+(defun ticktick--canonical-sync-file (file)
+  "Return a canonical absolute FILE, resolving relative paths under ticktick-dir."
+  (file-truename (expand-file-name file ticktick-dir)))
+
+(defun ticktick--project-file (project-id)
+  "Return the Org destination for PROJECT-ID."
+  (ticktick--canonical-sync-file
+   (or (cdr (assoc project-id ticktick-project-files)) ticktick-sync-file)))
+
+(defun ticktick--sync-files ()
+  "Return configured and remembered files, deduplicating aliases.
+Remember old destinations so changing a mapping does not look like deletion."
+  (delete-dups
+   (mapcar #'ticktick--canonical-sync-file
+           (delq nil
+                 (append (list ticktick-sync-file) (mapcar #'cdr ticktick-project-files)
+                         (plist-get ticktick--sync-state :sync-files)
+                         (cl-loop for move in (plist-get ticktick--sync-state :file-moves)
+                                  append (list (plist-get move :source) (plist-get move :destination)))
+                         (mapcar (lambda (op) (plist-get (plist-get op :local-record) :file))
+                                 (plist-get ticktick--sync-state :pending-operations)))))))
+
+(defun ticktick--sync-files-present-p ()
+  "Return non-nil if any configured or remembered sync file is present."
+  (cl-some (lambda (file) (or (file-exists-p file) (find-buffer-visiting file)))
+           (ticktick--sync-files)))
+
+(defun ticktick--remember-sync-files ()
+  "Persist known files before routing tasks to their destinations."
+  (setq ticktick--sync-state
+        (plist-put ticktick--sync-state :sync-files (ticktick--sync-files)))
+  (ticktick--save-state))
+
+(defun ticktick--org-buffer (file)
+  "Visit FILE, reusing a buffer already visiting the same canonical file."
+  (or (find-buffer-visiting file) (find-file-noselect file)))
+
+(defun ticktick--writable-org-buffer (file)
+  "Visit FILE for writing, creating its parent directories when needed."
+  (make-directory (file-name-directory file) t)
+  (ticktick--org-buffer file))
+
+(defun ticktick--records-in-file (file)
+  "Read active task records in FILE, ignoring unrelated Org headings."
+  (let (records)
+    (when (or (file-exists-p file) (find-buffer-visiting file))
+      (with-current-buffer (ticktick--org-buffer file)
+        (org-with-wide-buffer
+         (org-map-entries
+          (lambda ()
+            (when (and (= (org-current-level) 2)
+                       (not (org-entry-get nil "ARCHIVED_AT")))
+              (let* ((id (org-entry-get nil "TICKTICK_ID"))
+                     (local-id (org-entry-get nil "TICKTICK_LOCAL_ID"))
+                     (project-id (org-entry-get nil "TICKTICK_PROJECT_ID" t)))
+                (when (and (or id local-id) (not project-id))
+                  (error "TickTick task %s has no project in %s" (or id local-id) file))
+                (when project-id
+                  (push (list :id id :key (or id local-id (format "local:%s:%d" file (point)))
+                              :file file :position (point)
+                              :snapshot (ticktick--snapshot-from-org)) records)))))
+          nil nil))))
+    (nreverse records)))
+
 (defun ticktick--collect-local-records ()
-  "Read local task snapshots without modifying the sync file."
+  "Read task snapshots across all sync files without modifying them."
   (let (records seen)
-    (with-current-buffer (find-file-noselect ticktick-sync-file)
-      (org-with-wide-buffer
-       (org-map-entries
-        (lambda ()
-          (when (and (= (org-current-level) 2)
-                     (not (org-entry-get nil "ARCHIVED_AT")))
-            (let* ((id (org-entry-get nil "TICKTICK_ID"))
-                   (key (or id (org-entry-get nil "TICKTICK_LOCAL_ID")
-                            (format "local:%d" (point)))))
-              (when (member key seen) (error "Duplicate TickTick task ID: %s" key))
-              (push key seen)
-              (push (list :id id :key key :position (point)
-                          :snapshot (ticktick--snapshot-from-org)) records))))
-        nil nil)))
+    (dolist (file (ticktick--sync-files))
+      (dolist (record (ticktick--records-in-file file))
+        (let ((key (plist-get record :key)))
+          (when (member key seen) (error "Duplicate TickTick task ID: %s" key))
+          (push key seen)
+          (push record records))))
     (nreverse records)))
 
 (defun ticktick--read-remote-task (id project-id)
@@ -303,12 +361,98 @@ Merge independent edits, holding the entire task if any field conflicts."
           nil))
       (ticktick--create-project-heading (or name project-id) project-id)))
 
+(defun ticktick--record-in-file (file key)
+  "Find KEY in FILE, rejecting duplicate identities within that file."
+  (let ((records (cl-remove-if-not
+                  (lambda (record) (equal (plist-get record :key) key))
+                  (ticktick--records-in-file file))))
+    (when (cdr records) (error "Duplicate TickTick task %s in %s" key file))
+    (car records)))
+
+(defun ticktick--record-text (record)
+  "Return RECORD's full subtree, including unrelated Org properties."
+  (with-current-buffer (ticktick--org-buffer (plist-get record :file))
+    (org-with-wide-buffer
+     (goto-char (plist-get record :position))
+     (buffer-substring-no-properties (point) (save-excursion (org-end-of-subtree t t))))))
+
+(defun ticktick--same-move-text-p (text original)
+  "Compare TEXT and ORIGINAL, allowing an added final newline."
+  (equal (string-trim-right text "\n") (string-trim-right original "\n")))
+
+(defun ticktick--complete-file-move (move)
+  "Finish durable local MOVE, preserving a copy until the destination is saved."
+  (let* ((key (plist-get move :key))
+         (source-file (plist-get move :source))
+         (destination-file (plist-get move :destination))
+         (source (ticktick--record-in-file source-file key))
+         (destination (ticktick--record-in-file destination-file key))
+         (text (plist-get move :text)))
+    (when (and source (not (ticktick--same-move-text-p (ticktick--record-text source) text)))
+      (error "TickTick: source changed; inspect file move from %s to %s"
+             source-file destination-file))
+    (unless destination
+      (unless source (error "TickTick: neither copy of task %s is available" key))
+      (with-current-buffer (ticktick--writable-org-buffer destination-file)
+        (org-with-wide-buffer
+         (goto-char (ticktick--project-position (plist-get move :project-id)
+                                               (plist-get move :project-name)))
+         (org-end-of-subtree t t)
+         (unless (bolp) (insert "\n"))
+         (insert text)
+         (unless (bolp) (insert "\n"))
+         (save-buffer)))
+      (setq destination (ticktick--record-in-file destination-file key)))
+    (unless (and destination
+                 (ticktick--same-move-text-p (ticktick--record-text destination) text))
+      (error "TickTick: destination changed; inspect file move from %s to %s"
+             source-file destination-file))
+    (with-current-buffer (ticktick--org-buffer destination-file)
+      ;; Retry a destination save that previously failed after buffer insertion.
+      (when (buffer-modified-p) (save-buffer)))
+    (with-current-buffer (ticktick--org-buffer source-file)
+      (org-with-wide-buffer
+       (when source
+         (goto-char (plist-get source :position))
+         (delete-region (point) (save-excursion (org-end-of-subtree t t))))
+       ;; A previous removal may still be unsaved in this buffer.
+       (when (buffer-modified-p) (save-buffer))))
+    (setq ticktick--sync-state
+          (plist-put ticktick--sync-state :file-moves
+                     (cl-remove key (plist-get ticktick--sync-state :file-moves)
+                                :key (lambda (entry) (plist-get entry :key)) :test #'equal)))
+    (ticktick--save-state)))
+
+(defun ticktick--recover-file-moves ()
+  "Finish interrupted file moves before scanning for duplicate task IDs."
+  (dolist (move (copy-tree (plist-get ticktick--sync-state :file-moves)))
+    (ticktick--complete-file-move move)))
+
+(defun ticktick--relocate-record (record destination project-id project-name)
+  "Move RECORD to DESTINATION under PROJECT-ID, preserving its full subtree.
+Use PROJECT-NAME when a destination project heading must be created."
+  (let* ((key (plist-get record :key))
+         (move (list :key key :source (plist-get record :file)
+                     :destination destination :text (ticktick--record-text record)
+                     :project-id project-id :project-name project-name)))
+    (setq ticktick--sync-state
+          (plist-put ticktick--sync-state :file-moves
+                     (cons move (cl-remove key (plist-get ticktick--sync-state :file-moves)
+                                           :key (lambda (entry) (plist-get entry :key)) :test #'equal))))
+    (ticktick--save-state)
+    (ticktick--complete-file-move move)))
+
 (defun ticktick--write-local-snapshot (key id snapshot &optional project-name)
   "Save SNAPSHOT locally, finding KEY and assigning ID.
 Preserve unrelated properties on existing entries.
 Use PROJECT-NAME for imports."
-  (let ((record (ticktick--local-record key)))
-    (with-current-buffer (find-file-noselect ticktick-sync-file)
+  (ticktick--remember-sync-files)
+  (let* ((record (ticktick--local-record key))
+         (destination (ticktick--project-file (plist-get snapshot :project-id))))
+    (when (and record (not (equal (plist-get record :file) destination)))
+      (ticktick--relocate-record record destination (plist-get snapshot :project-id) project-name)
+      (setq record (ticktick--local-record key)))
+    (with-current-buffer (ticktick--writable-org-buffer destination)
       (org-with-wide-buffer
        (let* ((project-id (plist-get snapshot :project-id))
               (position (plist-get record :position))
@@ -372,7 +516,7 @@ Use PROJECT-NAME for imports."
 Archive writes precede source removal and retries reuse an existing archive."
   (let ((record (ticktick--local-record id)))
     (when record
-      (with-current-buffer (find-file-noselect ticktick-sync-file)
+      (with-current-buffer (ticktick--org-buffer (plist-get record :file))
         (org-with-wide-buffer
          (goto-char (plist-get record :position))
          (let* ((start (copy-marker (point)))
@@ -382,9 +526,9 @@ Archive writes precede source removal and retries reuse an existing archive."
                (progn
                  (when (eq ticktick-delete-behavior 'archive)
                    (with-current-buffer
-                       (find-file-noselect
+                       (ticktick--writable-org-buffer
                         (if (eq ticktick-archive-location 'separate-file)
-                            ticktick-archive-file ticktick-sync-file))
+                            ticktick-archive-file (plist-get record :file)))
                      (org-with-wide-buffer
                       (goto-char (point-min))
                       (unless (catch 'archived
@@ -509,7 +653,11 @@ REMOTE is the freshly verified remote record.  Return the verified record."
 (cl-defun ticktick--execute-operation (operation)
   "Execute one nonconflicting OPERATION with durable intent tracking."
   (ticktick--check-local-version operation)
-  (when (eq (plist-get operation :action) 'agree)
+  (when (and (eq (plist-get operation :action) 'agree)
+             (let ((record (ticktick--local-record (plist-get operation :key))))
+               (or (not record)
+                   (equal (plist-get record :file)
+                          (ticktick--project-file (plist-get (plist-get operation :target) :project-id))))))
     (cl-return-from ticktick--execute-operation
       (ticktick--finish-operation operation (plist-get operation :id)
                                   (plist-get operation :target))))
@@ -524,11 +672,11 @@ REMOTE is the freshly verified remote record.  Return the verified record."
       (require 'org-id)
       (let ((record (ticktick--local-record key)))
         (unless (plist-get operation :replaces-id)
-          (with-current-buffer (find-file-noselect ticktick-sync-file)
-          (goto-char (plist-get record :position))
-          (setq key (or (org-entry-get nil "TICKTICK_LOCAL_ID") (org-id-new)))
-          (org-entry-put nil "TICKTICK_LOCAL_ID" key)
-          (save-buffer))))
+          (with-current-buffer (ticktick--writable-org-buffer (plist-get record :file))
+            (goto-char (plist-get record :position))
+            (setq key (or (org-entry-get nil "TICKTICK_LOCAL_ID") (org-id-new)))
+            (org-entry-put nil "TICKTICK_LOCAL_ID" key)
+            (save-buffer))))
       (setq operation (plist-put operation :key key)))
     (setq operation (plist-put operation :phase 'prepared))
     (ticktick--journal-put operation)
@@ -597,8 +745,10 @@ Never automatically resubmit a creation whose returned ID was not recorded."
   (when ticktick--sync-in-progress (user-error "TickTick sync already running"))
   (let ((ticktick--sync-in-progress t))
     (ticktick--ensure-state-initialized)
+    (ticktick--recover-file-moves)
     (let* ((local (ticktick--collect-local-records))
            (remote (ticktick--collect-remote-records local)))
+      (ticktick--remember-sync-files)
       (ticktick--recover-pending local remote)
       (setq local (ticktick--collect-local-records))
       (let ((plan (ticktick--build-plan local remote))
