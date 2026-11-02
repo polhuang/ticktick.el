@@ -18,3 +18,9 @@ Reconciliation reads every project before planning writes. Known tasks missing f
 Before a write, refetch the affected task and compare it with the planned version. This narrows the race window; it cannot eliminate concurrent writes without a documented conditional-write guarantee. Do not claim atomic synchronization.
 
 A task baseline advances only after the local file is saved and the remote state is verified. Persist pending operations before mutation and preserve uncertain creations for explicit review. Do not test these guarantees by modifying a user's live TickTick account.
+
+## Deletion policies
+
+Unambiguous deletions follow `ticktick-delete-behavior`. `delete` applies them automatically; `archive` archives local removals (and requires review if `ticktick-confirm-deletions` is non-nil); `ask` queues them in the conflict review instead of prompting during background work. `sync-only` leaves them pending review and preserves their baselines. An explicit review choice can authorize a deletion.
+
+Delete-versus-edit cases always require review. The legacy `ticktick-deletion-conflict-policy` variable is retained for configuration compatibility, but is not used to guess the newest action: the API provides no reliable deletion timestamp. Keeping a locally edited task after remote deletion creates a new remote task and replaces its old ID only after verification. Archived headings retain their metadata and are excluded from active synchronization.

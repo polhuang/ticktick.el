@@ -174,6 +174,8 @@ This first stage deliberately holds all differing concurrent edits."
                                              (not (member (plist-get remote :id)
                                                           (plist-get ticktick--sync-state :org-task-ids))))
                                         'pull 'conflict))
+                  ((and (not ours) (equal theirs base)) 'delete-remote)
+                  ((and (not theirs) (equal ours base)) 'delete-local)
                   ((or (not ours) (not theirs)) 'conflict)
                   ((equal ours base) 'pull)
                   ((equal theirs base) 'push)
@@ -297,6 +299,54 @@ Preserve unrelated properties on existing entries.  Use PROJECT-NAME for imports
          (ticktick--update-sync-meta)
          (save-buffer))))))
 
+(defun ticktick--remove-local-task (id)
+  "Remove task ID locally, archiving it first when configured.
+Archive writes precede source removal and retries reuse an existing archive."
+  (let ((record (ticktick--local-record id)))
+    (when record
+      (with-current-buffer (find-file-noselect ticktick-sync-file)
+        (org-with-wide-buffer
+         (goto-char (plist-get record :position))
+         (let* ((start (copy-marker (point)))
+                (end (copy-marker (save-excursion (org-end-of-subtree t t))))
+                (text (buffer-substring-no-properties start end)))
+           (unwind-protect
+               (progn
+                 (when (eq ticktick-delete-behavior 'archive)
+                   (with-current-buffer
+                       (find-file-noselect
+                        (if (eq ticktick-archive-location 'separate-file)
+                            ticktick-archive-file ticktick-sync-file))
+                     (org-with-wide-buffer
+                      (goto-char (point-min))
+                      (unless (catch 'archived
+                                (org-map-entries
+                                 (lambda ()
+                                   (when (and (equal (org-entry-get nil "TICKTICK_ID") id)
+                                              (org-entry-get nil "ARCHIVED_AT"))
+                                     (throw 'archived t))) nil nil)
+                                nil)
+                        (goto-char (point-min))
+                        (unless (re-search-forward "^\\* Archived Tasks$" nil t)
+                          (goto-char (point-max))
+                          (unless (bolp) (insert "\n"))
+                          (insert "* Archived Tasks\n")
+                          (forward-line -1))
+                        (org-back-to-heading t)
+                        (org-end-of-subtree t t)
+                        (unless (bolp) (insert "\n"))
+                        (let ((position (point)))
+                          (insert text)
+                          (unless (bolp) (insert "\n"))
+                          (goto-char position)
+                          (org-entry-put nil "ARCHIVED_AT" (format-time-string "%FT%T%z"))
+                          (org-entry-put nil "ARCHIVED_REASON" "Deleted during TickTick sync")))
+                      (save-buffer))))
+                 (delete-region start end)
+                 (save-buffer))
+             (set-marker start nil)
+             (set-marker end nil))))))))
+
 (defun ticktick--journal-put (operation)
   "Persist OPERATION before performing its next mutation."
   (let* ((key (plist-get operation :key))
@@ -309,6 +359,8 @@ Preserve unrelated properties on existing entries.  Use PROJECT-NAME for imports
 
 (defun ticktick--finish-operation (operation id target)
   "Record successful OPERATION with ID and reconciled TARGET."
+  (when (plist-get operation :replaces-id)
+    (ticktick--set-baseline (plist-get operation :replaces-id) nil))
   (ticktick--set-baseline id target)
   (setq ticktick--sync-state
         (plist-put ticktick--sync-state :pending-operations
@@ -327,8 +379,9 @@ Preserve unrelated properties on existing entries.  Use PROJECT-NAME for imports
   "Refetch and verify OPERATION's remote source before mutation."
   (let* ((snapshot (plist-get operation :remote))
          (id (plist-get operation :id))
-         (current (and id snapshot
-                       (ticktick--read-remote-task id (plist-get snapshot :project-id)))))
+         (project-id (plist-get (or snapshot (plist-get operation :base)
+                                    (plist-get operation :local)) :project-id))
+         (current (and id project-id (ticktick--read-remote-task id project-id))))
     (unless (equal snapshot (plist-get current :snapshot))
       (error "TickTick: remote task changed since planning"))
     current))
@@ -379,15 +432,26 @@ REMOTE is the freshly verified remote record.  Return the verified record."
       ;; Give new headings an identity that survives edits and restarts.
       (require 'org-id)
       (let ((record (ticktick--local-record key)))
-        (with-current-buffer (find-file-noselect ticktick-sync-file)
+        (unless (plist-get operation :replaces-id)
+          (with-current-buffer (find-file-noselect ticktick-sync-file)
           (goto-char (plist-get record :position))
           (setq key (or (org-entry-get nil "TICKTICK_LOCAL_ID") (org-id-new)))
           (org-entry-put nil "TICKTICK_LOCAL_ID" key)
-          (save-buffer)))
+          (save-buffer))))
       (setq operation (plist-put operation :key key)))
     (setq operation (plist-put operation :phase 'prepared))
     (ticktick--journal-put operation)
     (pcase action
+      ('delete-remote
+       (unless (ticktick--delete-task-from-api id (plist-get (plist-get operation :remote) :project-id))
+         (error "TickTick: deletion failed"))
+       (when (ticktick--read-remote-task id (plist-get (plist-get operation :remote) :project-id))
+         (error "TickTick: deleted task is still present"))
+       (ticktick--check-local-version operation)
+       (when (plist-get operation :local) (ticktick--remove-local-task id)))
+      ('delete-local
+       (ticktick--check-local-version operation)
+       (ticktick--remove-local-task id))
       ('push (setq remote (ticktick--push-snapshot id target remote)))
       ('create
        (let ((response (ticktick-request "POST" "/open/v1/task"
@@ -406,7 +470,7 @@ REMOTE is the freshly verified remote record.  Return the verified record."
     (setq operation (plist-put operation :phase 'remote-applied))
     (ticktick--journal-put operation)
     ;; A network call may have allowed an Org edit while Emacs was waiting.
-    (ticktick--check-local-version operation)
+    (unless (memq action '(delete-local delete-remote)) (ticktick--check-local-version operation))
     (when target
       (ticktick--write-local-snapshot
        key id target (plist-get (plist-get operation :remote-record) :project-name)))
@@ -424,10 +488,13 @@ Never automatically resubmit a creation whose returned ID was not recorded."
            (ours (cl-find (or id key) local :key (lambda (r) (plist-get r :key)) :test #'equal))
            (ours (or ours (cl-find key local :key (lambda (r) (plist-get r :key)) :test #'equal)))
            (theirs (cl-find id remote :key (lambda (r) (plist-get r :id)) :test #'equal)))
-      (when (and id (equal target (plist-get theirs :snapshot))
+      (when (and id (not (plist-get theirs :unknown))
+                 (equal target (plist-get theirs :snapshot))
                  (or (equal (plist-get ours :snapshot) target)
                      (equal (plist-get ours :snapshot) (plist-get operation :local))))
-        (ticktick--write-local-snapshot (plist-get ours :key) id target)
+        (if target
+            (ticktick--write-local-snapshot (plist-get ours :key) id target)
+          (when ours (ticktick--remove-local-task id)))
         (ticktick--finish-operation operation id target)))))
 
 (defun ticktick--run-sync (&optional direction)
@@ -447,10 +514,18 @@ Never automatically resubmit a creation whose returned ID was not recorded."
                  (pending (cl-find key (plist-get ticktick--sync-state :pending-operations)
                                    :key (lambda (op) (plist-get op :key)) :test #'equal)))
             (cond
-             ((or pending (eq action 'conflict))
-              (push (or pending operation) conflicts))
-             ((or (and (eq direction 'pull) (memq action '(push create)))
-                  (and (eq direction 'push) (eq action 'pull))) nil)
+             (pending
+              (setq operation (plist-put operation :pending-intent pending))
+              (when (eq (plist-get pending :action) 'create)
+                (setq operation (plist-put operation :action 'create)))
+              (push operation conflicts))
+             ((eq action 'conflict) (push operation conflicts))
+             ((or (and (eq direction 'pull) (memq action '(push create delete-remote)))
+                  (and (eq direction 'push) (memq action '(pull delete-local)))) nil)
+             ((and (memq action '(delete-local delete-remote))
+                   (or (memq ticktick-delete-behavior '(ask sync-only))
+                       (and (eq ticktick-delete-behavior 'archive) ticktick-confirm-deletions)))
+              (push (plist-put operation :reason 'deletion-review) conflicts))
              (t
               (condition-case err
                   (ticktick--execute-operation operation)
@@ -493,12 +568,17 @@ Recheck both source versions before applying the decision."
                      ('org (plist-get conflict :local))
                      ('ticktick (plist-get conflict :remote))
                      ('edited edited)
+                     ('delete nil)
                      (_ (user-error "Unknown resolution choice"))))
            (operation (copy-tree conflict)))
-      (unless target (user-error "Deletion resolution is not available for this task"))
       (setf (plist-get operation :target) target
             (plist-get operation :action)
-            (if (equal target (plist-get conflict :remote)) 'pull 'push))
+            (cond ((not target) (if (plist-get conflict :remote) 'delete-remote 'delete-local))
+                  ((not (plist-get conflict :remote)) 'create)
+                  ((equal target (plist-get conflict :remote)) 'pull)
+                  (t 'push)))
+      (when (and target (not (plist-get conflict :remote)))
+        (setf (plist-get operation :replaces-id) (plist-get conflict :id)))
       (ticktick--execute-operation operation)
       (ticktick--remove-conflict key))))
 
@@ -643,6 +723,11 @@ Recheck both source versions before applying the decision."
               (insert "   ")))
           (insert-text-button "Edit merged task" 'follow-link t
                               'action (lambda (_) (ticktick-edit-conflict key)))
+          (insert "   ")
+          (insert-text-button "Delete both copies" 'follow-link t
+                              'action (lambda (_)
+                                        (ticktick-resolve-conflict key 'delete)
+                                        (ticktick-review-conflicts)))
           (insert "\nDefer: leave this task unresolved.\n")
           (when (eq (plist-get conflict :action) 'create)
             (insert-text-button "Attach created task ID" 'follow-link t

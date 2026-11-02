@@ -212,11 +212,9 @@ This setting is overridden when `ticktick-delete-behavior' is set to `delete'."
   :group 'ticktick)
 
 (defcustom ticktick-deletion-conflict-policy 'keep-newest
-  "How to resolve conflicts when a task is modified on one side and deleted on the other.
-- `keep-newest': Compare timestamps and keep the more recent action
-- `prefer-org': Always keep the Org version (don't delete if modified locally)
-- `prefer-api': Always keep the TickTick version (don't delete if modified remotely)
-- `ask': Prompt user to decide"
+  "Legacy deletion-conflict preference retained for configuration compatibility.
+The reconciler always records delete-versus-edit conflicts for explicit review.
+Deletion timestamps are unavailable, so keep-newest cannot be determined safely."
   :type '(choice (const :tag "Keep newest modification" keep-newest)
                  (const :tag "Prefer Org modifications" prefer-org)
                  (const :tag "Prefer TickTick modifications" prefer-api)
@@ -426,12 +424,17 @@ Returns a plist with :title, :project-id, and :position, or nil if not found."
 
 ;;; Deletion execution ---------------------------------------------------------
 
-(defun ticktick--delete-task-from-api (task-id)
-  "Delete task with TASK-ID from TickTick API.
+(defun ticktick--delete-task-from-api (task-id &optional project-id)
+  "Delete TASK-ID from PROJECT-ID, looking up its project if omitted.
 Returns t on success, nil on failure."
   (condition-case err
       (progn
-        (ticktick-request "DELETE" (format "/open/v1/task/%s" task-id))
+        (setq project-id (or project-id
+                             (plist-get (ticktick--baseline task-id) :project-id)
+                             (ticktick--get-cached-project-id task-id)
+                             (plist-get (ticktick--get-task-info task-id) :project-id)))
+        (unless project-id (error "Unknown project for task %s" task-id))
+        (ticktick-request "DELETE" (format "/open/v1/project/%s/task/%s" project-id task-id))
         (message "Deleted task %s from TickTick" task-id)
         t)
     (error
@@ -444,7 +447,7 @@ Returns t on success, nil on failure."
                    :error (error-message-string err)
                    :timestamp (format-time-string "%FT%T%z"))
              failed)
-       (plist-put ticktick--sync-state :failed-operations failed)
+       (setq ticktick--sync-state (plist-put ticktick--sync-state :failed-operations failed))
        (ticktick--save-state))
      nil)))
 
@@ -1058,26 +1061,30 @@ Return the buffer position at the start of the heading."
 
 ;;;###autoload
 (defun ticktick-delete-task-at-point ()
-  "Delete the TickTick task at point.
-This will delete the task both locally and from TickTick after confirmation.
-Respects the `ticktick-delete-behavior' setting."
+  "Delete the task at point through the guarded reconciliation executor.
+Archive the local copy when configured; respect the sync-only policy."
   (interactive)
-  (unless (derived-mode-p 'org-mode)
-    (user-error "This command must be run in an org-mode buffer"))
-  (let ((task-id (org-entry-get nil "TICKTICK_ID")))
-    (unless task-id
-      (user-error "No TickTick task at point"))
-    (let ((task-info (ticktick--get-task-info task-id)))
+  (unless (and (derived-mode-p 'org-mode) buffer-file-name
+               (file-equal-p buffer-file-name ticktick-sync-file))
+    (user-error "Use this command in the TickTick sync file"))
+  (when (eq ticktick-delete-behavior 'sync-only)
+    (user-error "Deletion is disabled by ticktick-delete-behavior"))
+  (let ((id (org-entry-get nil "TICKTICK_ID")))
+    (unless id (user-error "No TickTick task at point"))
+    (ticktick--ensure-state-initialized)
+    (let* ((local (ticktick--local-record id))
+           (remote (ticktick--read-remote-task
+                    id (plist-get (plist-get local :snapshot) :project-id)))
+           (operation (list :id id :key id :local (plist-get local :snapshot)
+                            :remote (plist-get remote :snapshot)
+                            :base (ticktick--baseline id) :local-record local
+                            :remote-record remote :target nil
+                            :action (if remote 'delete-remote 'delete-local))))
       (when (or (eq ticktick-delete-behavior 'delete)
-                (y-or-n-p (format "Delete task '%s' from both Org and TickTick? "
-                                 (plist-get task-info :title))))
-        ;; Delete from API first
-        (when (ticktick--delete-task-from-api task-id)
-          ;; Then delete from Org
-          (delete-region (org-entry-beginning-position)
-                        (org-entry-end-position))
-          (save-buffer)
-          (message "Task deleted successfully"))))))
+                (y-or-n-p "Delete this task from Org and TickTick? "))
+        (ticktick--execute-operation operation)
+        (ticktick--remove-conflict id)
+        (message "TickTick: task deleted")))))
 
 ;;;###autoload
 (defun ticktick-retry-failed-deletions ()
@@ -1108,7 +1115,7 @@ Respects the `ticktick-delete-behavior' setting."
               (error
                (message "Failed to retry operation for task %s: %s"
                        task-id (error-message-string err))))))
-        (plist-put ticktick--sync-state :failed-operations failed)
+        (setq ticktick--sync-state (plist-put ticktick--sync-state :failed-operations failed))
         (ticktick--save-state)
         (message "Retry complete: %d/%d operations succeeded"
                 success-count retry-count)))))
