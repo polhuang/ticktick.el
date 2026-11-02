@@ -462,5 +462,201 @@ Never automatically resubmit a creation whose returned ID was not recorded."
         (ticktick--save-state)
         (message "TickTick: sync finished; %d task(s) need review" (length conflicts))))))
 
+(defun ticktick--conflict (key)
+  "Find the recorded conflict for KEY."
+  (or (cl-find key (plist-get ticktick--sync-state :conflicts)
+               :key (lambda (op) (plist-get op :key)) :test #'equal)
+      (user-error "Conflict no longer exists; refresh the review")))
+
+(defun ticktick--remove-conflict (key)
+  "Remove the resolved conflict identified by KEY and persist state."
+  (setq ticktick--sync-state
+        (plist-put ticktick--sync-state :conflicts
+                   (cl-remove key (plist-get ticktick--sync-state :conflicts)
+                              :key (lambda (op) (plist-get op :key)) :test #'equal)))
+  (ticktick--save-state))
+
+(defun ticktick-resolve-conflict (key choice &optional edited)
+  "Resolve KEY using CHOICE (org, ticktick, or edited snapshot EDITED).
+Recheck both source versions before applying the decision."
+  (let* ((conflict (ticktick--conflict key))
+         (pending (cl-find key (plist-get ticktick--sync-state :pending-operations)
+                           :key (lambda (op) (plist-get op :key)) :test #'equal)))
+    (when (and pending (eq (plist-get pending :action) 'create)
+               (not (plist-get pending :created-id)))
+      (user-error "Creation outcome unknown: attach its ID or verify failure before retrying"))
+    (when (plist-get (plist-get conflict :remote-record) :unknown)
+      (user-error "Restore access to the project before resolving this task"))
+    (ticktick--check-local-version conflict)
+    (ticktick--check-remote-version conflict)
+    (let* ((target (pcase choice
+                     ('org (plist-get conflict :local))
+                     ('ticktick (plist-get conflict :remote))
+                     ('edited edited)
+                     (_ (user-error "Unknown resolution choice"))))
+           (operation (copy-tree conflict)))
+      (unless target (user-error "Deletion resolution is not available for this task"))
+      (setf (plist-get operation :target) target
+            (plist-get operation :action)
+            (if (equal target (plist-get conflict :remote)) 'pull 'push))
+      (ticktick--execute-operation operation)
+      (ticktick--remove-conflict key))))
+
+(defun ticktick-link-pending-creation (key id)
+  "Attach remote task ID to an uncertain creation identified by KEY."
+  (interactive
+   (list (completing-read "Pending creation: "
+                          (mapcar (lambda (op) (plist-get op :key))
+                                  (plist-get ticktick--sync-state :pending-operations)) nil t)
+         (read-string "Created TickTick task ID: ")))
+  (let* ((operation (cl-find key (plist-get ticktick--sync-state :pending-operations)
+                             :key (lambda (op) (plist-get op :key)) :test #'equal))
+         (target (plist-get operation :target))
+         (remote (ticktick--read-remote-task id (plist-get target :project-id))))
+    (unless (and (eq (plist-get operation :action) 'create)
+                 (equal target (plist-get remote :snapshot)))
+      (user-error "Remote task does not match the pending creation"))
+    (ticktick--check-local-version operation)
+    (setf (plist-get operation :created-id) id)
+    (ticktick--journal-put operation)
+    (ticktick--write-local-snapshot key id target)
+    (ticktick--finish-operation operation id target)
+    (ticktick--remove-conflict key)))
+
+(defun ticktick-retry-pending-creation (key)
+  "Release uncertain creation KEY only after explicit verification of failure."
+  (interactive
+   (list (completing-read "Pending creation: "
+                          (mapcar (lambda (op) (plist-get op :key))
+                                  (plist-get ticktick--sync-state :pending-operations)) nil t)))
+  (let ((operation (cl-find key (plist-get ticktick--sync-state :pending-operations)
+                            :key (lambda (op) (plist-get op :key)) :test #'equal)))
+    (unless (and (eq (plist-get operation :action) 'create)
+                 (not (plist-get operation :created-id)))
+      (user-error "This is not an uncertain creation"))
+    (when (yes-or-no-p "Have you verified in TickTick that this task was NOT created? ")
+      (setq ticktick--sync-state
+            (plist-put ticktick--sync-state :pending-operations
+                       (delq operation (plist-get ticktick--sync-state :pending-operations))))
+      (ticktick--remove-conflict key)
+      (message "TickTick: creation may be retried on the next sync"))))
+
+(defvar-local ticktick--editing-conflict-key nil
+  "Conflict being edited in the current buffer.")
+
+(defvar ticktick-conflict-edit-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map org-mode-map)
+    (define-key map (kbd "C-c C-c") #'ticktick-conflict-edit-save)
+    (define-key map (kbd "C-c C-k") #'kill-current-buffer)
+    map)
+  "Keys for editing a conflict resolution.")
+
+(define-derived-mode ticktick-conflict-edit-mode org-mode "TickTick Merge"
+  "Edit a task; C-c C-c applies the resolution and C-c C-k cancels.")
+
+(defun ticktick-edit-conflict (key)
+  "Open an editable Org representation of conflict KEY."
+  (let* ((conflict (ticktick--conflict key))
+         (snapshot (or (plist-get conflict :local) (plist-get conflict :remote))))
+    (unless snapshot (user-error "No surviving task to edit"))
+    (pop-to-buffer (generate-new-buffer "*TickTick Merge*"))
+    (ticktick-conflict-edit-mode)
+    (setq ticktick--editing-conflict-key key)
+    (insert "* Project\n:PROPERTIES:\n:TICKTICK_PROJECT_ID: "
+            (plist-get snapshot :project-id) "\n:END:\n")
+    (let ((task (list :id (plist-get conflict :id)
+                      :title (plist-get snapshot :title)
+                      :content (plist-get snapshot :content)
+                      :status (plist-get snapshot :status)
+                      :priority (plist-get snapshot :priority)
+                      :tags (plist-get snapshot :tags))))
+      (insert (ticktick--task-to-heading task) "\n"))
+    (goto-char (point-min))
+    (re-search-forward "^\\*\\* ") (beginning-of-line)
+    (let* ((deadline (plist-get snapshot :deadline))
+           (value (plist-get deadline :value)))
+      (when value
+        (org-deadline nil (if (plist-get deadline :all-day) value
+                           (format-time-string "%F %a %H:%M" (date-to-time value)))))
+      (when (plist-get deadline :time-zone)
+        (org-entry-put nil "TICKTICK_TIME_ZONE" (plist-get deadline :time-zone))))
+    (set-buffer-modified-p nil)
+    (message "Edit the task; C-c C-c applies, C-c C-k cancels")))
+
+(defun ticktick-conflict-edit-save ()
+  "Apply the edited task after rechecking the reviewed source versions."
+  (interactive)
+  (unless ticktick--editing-conflict-key (user-error "No conflict in this buffer"))
+  (let ((key ticktick--editing-conflict-key)
+        (buffer (current-buffer)))
+    (goto-char (point-min))
+    (unless (re-search-forward "^\\*\\* " nil t) (user-error "Keep a task heading"))
+    (beginning-of-line)
+    (ticktick-resolve-conflict key 'edited (ticktick--snapshot-from-org))
+    (set-buffer-modified-p nil)
+    (kill-buffer buffer)
+    (ticktick-review-conflicts)))
+
+(define-derived-mode ticktick-conflicts-mode special-mode "TickTick Conflicts"
+  "Review conflicts; g refreshes synchronization and q closes the buffer.")
+
+(define-key ticktick-conflicts-mode-map (kbd "g") #'ticktick-refresh-conflicts)
+
+(defun ticktick-refresh-conflicts ()
+  "Refresh task snapshots and rebuild the conflict review."
+  (interactive)
+  (ticktick-sync)
+  (ticktick-review-conflicts))
+
+;;;###autoload
+(defun ticktick-review-conflicts ()
+  "Display recorded conflicts with explicit choices; never prompt during autosync."
+  (interactive)
+  (require 'pp)
+  (require 'button)
+  (ticktick--ensure-state-initialized)
+  (let ((conflicts (plist-get ticktick--sync-state :conflicts)))
+    (pop-to-buffer (get-buffer-create "*TickTick Conflicts*"))
+    (ticktick-conflicts-mode)
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (insert "TickTick conflicts\n\ng: fetch fresh versions    q: close\n\n")
+      (unless conflicts (insert "No unresolved conflicts.\n"))
+      (dolist (conflict conflicts)
+        (let ((key (plist-get conflict :key)))
+          (insert (format "Task: %s [%s]\n"
+                          (or (plist-get (plist-get conflict :local) :title)
+                              (plist-get (plist-get conflict :remote) :title) key) key))
+          (when (plist-get conflict :error)
+            (insert (format "Last error: %s\n" (plist-get conflict :error))))
+          (dolist (version '(("Base" . :base) ("Org" . :local) ("TickTick" . :remote)))
+            (insert (format "%s:\n%s\n" (car version)
+                            (pp-to-string (plist-get conflict (cdr version))))))
+          (dolist (choice '(("Use Org" . org) ("Use TickTick" . ticktick)))
+            (let ((decision (cdr choice)))
+              (insert-text-button
+               (car choice) 'follow-link t
+               'action (lambda (_)
+                         (ticktick-resolve-conflict key decision)
+                         (ticktick-review-conflicts)))
+              (insert "   ")))
+          (insert-text-button "Edit merged task" 'follow-link t
+                              'action (lambda (_) (ticktick-edit-conflict key)))
+          (insert "\nDefer: leave this task unresolved.\n")
+          (when (eq (plist-get conflict :action) 'create)
+            (insert-text-button "Attach created task ID" 'follow-link t
+                                'action (lambda (_)
+                                          (ticktick-link-pending-creation key (read-string "Task ID: "))
+                                          (ticktick-review-conflicts)))
+            (insert "   ")
+            (insert-text-button "Verified creation failed: allow retry" 'follow-link t
+                                'action (lambda (_)
+                                          (ticktick-retry-pending-creation key)
+                                          (ticktick-review-conflicts)))
+            (insert "\n"))
+          (insert "\n")))
+      (goto-char (point-min)))))
+
 (provide 'ticktick-reconcile)
 ;;; ticktick-reconcile.el ends here

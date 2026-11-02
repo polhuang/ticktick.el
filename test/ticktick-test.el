@@ -257,4 +257,57 @@
     (dolist (entry ticktick-test--requests)
       (should (equal (plist-get (cadr entry) :type) "GET")))))
 
+(defun ticktick-test--seed-task (title)
+  "Save a task with TITLE and an unrelated property for integration tests."
+  (with-current-buffer (find-file-noselect ticktick-sync-file)
+    (org-mode)
+    (erase-buffer)
+    (insert "* Inbox\n:PROPERTIES:\n:TICKTICK_PROJECT_ID: inbox\n:END:\n"
+            "** TODO " title "\n:PROPERTIES:\n:TICKTICK_ID: one\n:CUSTOM: keep\n:END:\n")
+    (save-buffer))
+  (ticktick--local-record "one"))
+
+(ert-deftest ticktick-review-resolution-preserves-unrelated-org-properties ()
+  (ticktick-test--with-api
+      '((200 . "{\"id\":\"one\",\"title\":\"Remote\",\"projectId\":\"inbox\"}")
+        (200 . "{\"id\":\"one\",\"title\":\"Remote\",\"projectId\":\"inbox\"}"))
+    (let* ((local (ticktick-test--seed-task "Local"))
+           (remote (ticktick-test--record
+                    (ticktick--snapshot-from-api '(:title "Remote" :projectId "inbox"))))
+           (conflict (ticktick--plan-task local remote '(:title "Base"))))
+      (setq ticktick--sync-state (plist-put ticktick--sync-state :conflicts (list conflict)))
+      (ticktick-resolve-conflict "one" 'ticktick)
+      (should (equal (plist-get (ticktick--baseline "one") :title) "Remote"))
+      (should-not (plist-get ticktick--sync-state :conflicts))
+      (with-current-buffer (find-file-noselect ticktick-sync-file)
+        (goto-char (plist-get (ticktick--local-record "one") :position))
+        (should (equal (org-entry-get nil "CUSTOM") "keep"))))))
+
+(ert-deftest ticktick-resolution-refuses-stale-local-version ()
+  (ticktick-test--with-api nil
+    (let* ((local (ticktick-test--seed-task "Local"))
+           (conflict (ticktick--plan-task local (ticktick-test--record '(:title "Remote")) nil)))
+      (setq ticktick--sync-state (plist-put ticktick--sync-state :conflicts (list conflict)))
+      (with-current-buffer (find-file-noselect ticktick-sync-file)
+        (goto-char (plist-get local :position))
+        (org-edit-headline "New local edit"))
+      (should-error (ticktick-resolve-conflict "one" 'ticktick))
+      (should-not ticktick-test--requests))))
+
+(ert-deftest ticktick-merge-editor-roundtrips-timed-task ()
+  (ticktick-test--with-api nil
+    (let* ((snapshot (ticktick--snapshot-from-api
+                      '(:title "Task" :projectId "inbox" :priority 5 :status 2
+                        :content "Description" :dueDate "2026-11-06T13:30:00Z"
+                        :timeZone "Europe/Helsinki" :isAllDay :false :tags ("work"))))
+           (conflict (list :key "one" :id "one" :local snapshot)))
+      (setq ticktick--sync-state (plist-put ticktick--sync-state :conflicts (list conflict)))
+      (save-window-excursion
+        (unwind-protect
+            (progn
+              (ticktick-edit-conflict "one")
+              (should (equal snapshot (ticktick--snapshot-from-org)))
+              (should (eq (key-binding (kbd "C-c C-c")) #'ticktick-conflict-edit-save)))
+          (when (get-buffer "*TickTick Merge*") (kill-buffer "*TickTick Merge*")))))))
+
 ;;; ticktick-test.el ends here
