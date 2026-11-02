@@ -755,6 +755,8 @@ Starts local server, requests consent through browser, then captures redirect."
         nil
       (json-read))))
 
+(define-error 'ticktick-api-error "TickTick API request failed")
+
 (defun ticktick-request (method endpoint &optional data)
   "Send METHOD to TickTick ENDPOINT with optional body DATA.
 Return parsed response data, or nil for a successful empty response.
@@ -791,9 +793,10 @@ unauthorized request once after refreshing the token."
         (unless succeeded
           (if (and (equal status 401) (= attempt 0))
               (ticktick-refresh-token)
-            (error "TickTick %s %s failed (HTTP %s): %s"
-                   method endpoint (or status "unavailable")
-                   (or failure "unsuccessful response"))))))
+            (signal 'ticktick-api-error
+                    (list (format "%s %s failed: %s" method endpoint
+                                  (or failure "unsuccessful response"))
+                          status))))))
     response-data))
 
 ;;; Org conversion helpers -----------------------------------------------------

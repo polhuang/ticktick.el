@@ -166,4 +166,37 @@
     (ticktick--set-baseline "one" nil)
     (should-not (ticktick--baseline "one"))))
 
+(defun ticktick-test--record (snapshot)
+  "Wrap SNAPSHOT in an identified record."
+  (and snapshot (list :id "one" :key "one" :snapshot snapshot)))
+
+(ert-deftest ticktick-plan-holds-concurrent-and-unbased-edits ()
+  (let ((ticktick--sync-state nil)
+        (base '(:title "base")))
+    (dolist (case '(("base" "remote" pull) ("local" "base" push)
+                    ("same" "same" agree) ("local" "remote" conflict)))
+      (let ((plan (ticktick--plan-task
+                   (ticktick-test--record (list :title (nth 0 case)))
+                   (ticktick-test--record (list :title (nth 1 case))) base)))
+        (should (eq (plist-get plan :action) (nth 2 case)))))
+    (should (eq (plist-get (ticktick--plan-task
+                            (ticktick-test--record '(:title "local"))
+                            (ticktick-test--record '(:title "remote")) nil) :action)
+                'conflict))))
+
+(ert-deftest ticktick-remote-verifies-missing-completed-task ()
+  (ticktick-test--with-api
+      '((200 . "[]") (200 . "{\"tasks\":[]}")
+        (200 . "{\"id\":\"one\",\"projectId\":\"inbox\",\"title\":\"Done\",\"status\":2}"))
+    (setq ticktick--sync-state (list :baselines '(("one" . (:project-id "inbox")))))
+    (let ((records (ticktick--collect-remote-records nil)))
+      (should (= (length records) 1))
+      (should (= (plist-get (plist-get (car records) :snapshot) :status) 2)))))
+
+(ert-deftest ticktick-remote-only-404-confirms-absence ()
+  (ticktick-test--with-api '((404 . ""))
+    (should-not (ticktick--read-remote-task "one" "inbox")))
+  (ticktick-test--with-api '((403 . ""))
+    (should-error (ticktick--read-remote-task "one" "inbox"))))
+
 ;;; ticktick-test.el ends here
