@@ -27,5 +27,7 @@ jobs:
         # RECIPE is your recipe as written for MELPA:
         RECIPE: (ticktick :fetcher github :repo "polhuang/ticktick.el")
         # set this to false (or remove it) if the package isn't on MELPA:
-        EXIST_OK: false
-      run: echo $GITHUB_REF && make -C ~/melpazoid
+        EXIST_OK: 'true'
+      # Command-line make variables survive recursive make through MAKEFLAGS.
+      # This overrides melpazoid.py forcing DOCKER_OUTPUT=--quiet in its environment.
+      run: make -C ~/melpazoid DOCKER_OUTPUT=--progress=plain
