@@ -66,6 +66,7 @@
 ;; - `ticktick-authorize': Set up OAuth authentication
 ;; - `ticktick-refresh-token': Manually refresh auth token
 ;; - `ticktick-toggle-sync-timer': Toggle automatic timer-based syncing
+;; - `ticktick-set-project-file': Choose project destinations before first sync
 ;; - `ticktick-delete-task-at-point': Delete task at cursor from both sides
 ;; - `ticktick-show-sync-state': View current synchronization state
 ;; - `ticktick-retry-failed-deletions': Retry any failed deletion operations
@@ -903,6 +904,15 @@ Return the buffer position at the start of the heading."
            (throw 'found (point))))
        nil 'tree)
       nil)))
+
+;;;###autoload
+(defun ticktick-set-project-file (&optional session-only)
+  "Choose a TickTick project by name and save its Org destination.
+Fetch projects directly, without an initial task sync.  Create the chosen
+file and project heading if needed.  Persist mappings using Customize;
+with prefix argument SESSION-ONLY, change them only for this session."
+  (interactive "P")
+  (ticktick--call-with-sync-lock #'ticktick--configure-project-file session-only))
 
 (defun ticktick-fetch-to-org ()
   "Fetch remote changes, preserving local edits and recording conflicts."

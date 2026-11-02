@@ -72,7 +72,11 @@ M-x ticktick-authorize
 
 This will open your browser for OAuth consent and automatically capture the authorization.
 
-### 4. Perform Initial Sync
+### 4. Choose Project Files (Optional)
+
+After authorization, run `M-x ticktick-set-project-file`. Choose a project by name, then select an Org file. Repeat for each project you want in a separate file. No initial sync or copying IDs is needed; Inbox is included in the picker.
+
+### 5. Perform Initial Sync
 
 ```
 M-x ticktick-sync
@@ -85,6 +89,7 @@ M-x ticktick-sync
 | Command | Description |
 |---------|-------------|
 | `ticktick-sync` | Fetch, compare, and reconcile both sides |
+| `ticktick-set-project-file` | Choose a project by name and save its Org destination |
 | `ticktick-preview-sync` | Preview changes without writing tasks |
 | `ticktick-review-conflicts` | Review and resolve conflicting tasks |
 | `ticktick-fetch-to-org` | Pull tasks from TickTick to Org |
@@ -137,7 +142,15 @@ Task description content here.
 
 ### Project-specific Org files
 
-Map TickTick project IDs to Org files with `ticktick-project-files`:
+The easiest setup is `M-x ticktick-set-project-file` after authorization:
+
+1. Choose a TickTick project by name (including Inbox).
+2. Choose an existing or new Org file.
+3. Repeat for other projects, then run `M-x ticktick-sync`.
+
+The command fetches project names directly from TickTick, so it works before the first sync. It creates missing directories, the Org file, and its project heading immediately, while preserving existing notes. Your mapping is saved through Emacs Customize (`custom-file`, or your init file). Use `C-u M-x ticktick-set-project-file` for a session-only mapping, including when running Emacs without an init file.
+
+Alternatively, configure `ticktick-project-files` directly:
 
 ```elisp
 (setq ticktick-project-files
@@ -146,9 +159,9 @@ Map TickTick project IDs to Org files with `ticktick-project-files`:
         ("inbox" . "~/org/inbox.org")))
 ```
 
-Find a project's ID in its `TICKTICK_PROJECT_ID` property after an initial sync. Keys are IDs, not list names, so renaming a list does not change its destination. Use `"inbox"` for Inbox. Projects without a mapping continue to use `ticktick-sync-file`. Relative file paths are resolved under `ticktick-dir`.
+For manual configuration, find a project's ID in its `TICKTICK_PROJECT_ID` property after a sync; the interactive command does not require this step. Keys are IDs, not list names, so renaming a list does not change its destination. Use `"inbox"` for Inbox. Projects without a mapping continue to use `ticktick-sync-file`. Relative file paths are resolved under `ticktick-dir`.
 
-Run `M-x ticktick-sync` to apply the mapping. Missing files and parent directories are created when a task is written. The file retains the usual structure: a top-level project heading with `TICKTICK_PROJECT_ID`, followed by second-level task headings. Multiple projects can share one file. Unrelated headings outside TickTick project subtrees are ignored.
+Run `M-x ticktick-sync` to apply the mapping. Missing files and parent directories are created when a task is written. The file retains the usual structure: a top-level project heading with `TICKTICK_PROJECT_ID`, followed by second-level task headings. Multiple projects can share one file. Unrelated headings outside TickTick project subtrees are ignored. TickTick sections are currently flattened into tasks under the project heading; section structure is not synchronized.
 
 Existing tasks move to the configured destination on sync, preserving their IDs and properties. The state file remembers old destinations, so changing or removing a mapping relocates tasks instead of treating them as deleted. File moves save the destination before removing the source and can recover after an interrupted save. If either copy was edited during an interrupted move, synchronization stops and identifies both files for inspection.
 

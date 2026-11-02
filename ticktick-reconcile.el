@@ -37,6 +37,7 @@
 (declare-function ticktick--delete-task-from-api "ticktick" (id &optional project-id))
 (declare-function ticktick--task-to-heading "ticktick" (task))
 (declare-function ticktick-sync "ticktick")
+(declare-function custom-file "cus-edit" (&optional no-error))
 
 (defconst ticktick--snapshot-fields
   '(:title :content :status :priority :deadline :tags :project-id)
@@ -203,11 +204,80 @@ Remember old destinations so changing a mapping does not look like deletion."
     (ticktick-api-error
      (if (equal (nth 2 err) 404) nil (signal (car err) (cdr err))))))
 
+(defun ticktick--list-projects ()
+  "Fetch project IDs and display names directly from TickTick, including Inbox."
+  (let ((projects (cons '(:id "inbox" :name "Inbox")
+                        (cl-remove "inbox" (ticktick-request "GET" "/open/v1/project")
+                                   :key (lambda (project) (plist-get project :id)) :test #'equal)))
+        seen)
+    (dolist (project projects)
+      (let ((id (plist-get project :id)) (name (plist-get project :name)))
+        (unless (and (stringp id) (not (string-empty-p id))
+                     (stringp name) (not (string-empty-p name))
+                     (not (member id seen)))
+          (error "TickTick: invalid or duplicate project"))
+        (push id seen)))
+    projects))
+
+(defun ticktick--configure-project-file (session-only)
+  "Choose and initialize a project destination, optionally SESSION-ONLY."
+  (let* ((projects (ticktick--list-projects))
+         (choices (mapcar
+                   (lambda (project)
+                     (let ((name (plist-get project :name)))
+                       (cons (if (> (cl-count name projects :key (lambda (p) (plist-get p :name))
+                                              :test #'equal) 1)
+                                 (format "%s [%s]" name (plist-get project :id)) name)
+                             project)))
+                   projects))
+         (project (cdr (assoc (completing-read "TickTick project: " choices nil t) choices)))
+         (id (plist-get project :id))
+         (name (plist-get project :name)))
+    (unless id (user-error "Choose a TickTick project"))
+    (let* ((slug (string-trim (replace-regexp-in-string "[^[:alnum:]_-]+" "-" (downcase name)) "-+" "-+"))
+           (suggested (or (cdr (assoc id ticktick-project-files))
+                          (expand-file-name (concat (if (string-empty-p slug) "project" slug) ".org")
+                                            (file-name-directory
+                                             (ticktick--canonical-sync-file ticktick-sync-file)))))
+           (default (ticktick--canonical-sync-file suggested))
+           (file (ticktick--canonical-sync-file
+                  (expand-file-name
+                   (read-file-name (format "Org file for %s: " name)
+                                   (file-name-directory default) default nil
+                                   (file-name-nondirectory default))
+                   (file-name-directory default))))
+           (previous (copy-tree ticktick-project-files)))
+      (when (file-directory-p file) (user-error "Choose an Org file, not a directory"))
+      (unless session-only
+        (require 'cus-edit)
+        (unless (custom-file t)
+          (user-error "Cannot save preferences here; use C-u M-x ticktick-set-project-file for this session")))
+      (ticktick--ensure-state-initialized)
+      ;; Preserve previous destinations even when remapping before the first sync.
+      (ticktick--remember-sync-files)
+      (with-current-buffer (ticktick--writable-org-buffer file)
+        (org-with-wide-buffer
+         (ticktick--project-position id name)
+         (save-buffer)))
+      (let ((mappings (cons (cons id file) (assoc-delete-all id (copy-tree previous)))))
+        (if session-only
+            (setq ticktick-project-files mappings)
+          (condition-case err
+              (progn
+                (customize-save-variable 'ticktick-project-files mappings)
+                (setq ticktick-project-files mappings))
+            (error
+             (setq ticktick-project-files previous)
+             (signal (car err) (cdr err))))))
+      (ticktick--remember-sync-files)
+      (message "TickTick: %s uses %s%s. Run ticktick-sync to import tasks."
+               name file (if session-only " (this session)" " (saved)"))
+      (cons id file))))
+
 (defun ticktick--collect-remote-records (local-records)
   "Fetch a complete remote snapshot, verifying known IDs from LOCAL-RECORDS.
 A missing project is represented as unknown, never as confirmed deletion."
-  (let* ((projects (cons '(:id "inbox" :name "Inbox")
-                         (ticktick-request "GET" "/open/v1/project")))
+  (let* ((projects (ticktick--list-projects))
          (known (delete-dups
                  (append (mapcar (lambda (r) (plist-get r :id)) local-records)
                          (mapcar #'car (plist-get ticktick--sync-state :baselines))
