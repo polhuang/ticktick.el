@@ -145,4 +145,25 @@
       (should (equal (plist-get snapshot :tags) '("a" "z")))
       (should (equal (plist-get (plist-get snapshot :deadline) :value) "2026-11-06")))))
 
+(ert-deftest ticktick-state-migration-preserves-history-without-assuming-a-base ()
+  (let* ((old '(:org-task-ids ("one") :api-task-ids ("two")))
+         (new (ticktick--migrate-state (copy-tree old))))
+    (should (equal (plist-get new :org-task-ids) '("one")))
+    (should (equal (plist-get new :api-task-ids) '("two")))
+    (should-not (plist-get new :baselines))
+    (should (equal new (ticktick--migrate-state (copy-tree new))))
+    (should-error (ticktick--migrate-state '(:version 999)))))
+
+(ert-deftest ticktick-baselines-survive-state-roundtrip ()
+  (ticktick-test--with-api nil
+    (ticktick--ensure-state-initialized)
+    (ticktick--set-baseline "one" '(:title "before"))
+    (ticktick--save-state)
+    (setq ticktick--sync-state nil)
+    (ticktick--load-state)
+    (should (equal (ticktick--baseline "one") '(:title "before")))
+    (should (= (logand (file-modes (ticktick--state-file-path)) #o777) #o600))
+    (ticktick--set-baseline "one" nil)
+    (should-not (ticktick--baseline "one"))))
+
 ;;; ticktick-test.el ends here

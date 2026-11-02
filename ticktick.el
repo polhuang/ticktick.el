@@ -273,29 +273,40 @@ This is a plist with keys:
   "Return the path to the state file."
   (expand-file-name ".ticktick-state.el" ticktick-dir))
 
+(defconst ticktick--state-version 2
+  "Current synchronization state schema version.")
+
+(defun ticktick--migrate-state (state)
+  "Return STATE upgraded without inventing per-task baselines."
+  (unless (listp state) (error "Invalid TickTick state"))
+  (when (> (or (plist-get state :version) 1) ticktick--state-version)
+    (error "TickTick state was written by a newer package"))
+  (dolist (key '(:baselines :pending-operations :conflicts))
+    (unless (plist-member state key)
+      (setq state (plist-put state key nil))))
+  (plist-put state :version ticktick--state-version))
+
 (defun ticktick--load-state ()
-  "Load sync state from disk into `ticktick--sync-state`."
+  "Load and migrate sync state; signal on corruption rather than losing history."
   (let ((state-file (ticktick--state-file-path)))
     (when (file-exists-p state-file)
-      (condition-case err
-          (with-temp-buffer
-            (insert-file-contents state-file)
-            (goto-char (point-min))
-            (setq ticktick--sync-state (read (current-buffer))))
-        (error
-         (message "Warning: Could not load state file: %s" (error-message-string err))
-         (setq ticktick--sync-state nil))))))
+      (with-temp-buffer
+        (insert-file-contents state-file)
+        (setq ticktick--sync-state
+              (ticktick--migrate-state (read (current-buffer))))))))
 
 (defun ticktick--save-state ()
-  "Persist `ticktick--sync-state` to disk."
+  "Atomically persist state, signaling failure before subsequent mutations."
   (when ticktick--sync-state
     (ticktick--ensure-dir)
-    (let ((state-file (ticktick--state-file-path)))
-      (condition-case err
-          (with-temp-file state-file
-            (insert (prin1-to-string ticktick--sync-state)))
-        (error
-         (message "Warning: Could not save state file: %s" (error-message-string err)))))))
+    (let ((temporary (make-temp-file (expand-file-name ".state-" ticktick-dir))))
+      (unwind-protect
+          (progn
+            (with-temp-file temporary
+              (insert (prin1-to-string ticktick--sync-state)))
+            (set-file-modes temporary #o600)
+            (rename-file temporary (ticktick--state-file-path) t))
+        (when (file-exists-p temporary) (delete-file temporary))))))
 
 (defun ticktick--collect-org-task-ids ()
   "Scan the org sync file and return a list of all TICKTICK_ID values."
@@ -357,7 +368,8 @@ This is a plist with keys:
                 :task-project-map nil
                 :pending-deletes nil
                 :failed-operations nil))
-    (ticktick--save-state)))
+    (ticktick--save-state))
+  (setq ticktick--sync-state (ticktick--migrate-state ticktick--sync-state)))
 
 ;; Load state at startup
 (ticktick--load-state)

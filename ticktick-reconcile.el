@@ -75,5 +75,17 @@
             (when (plist-get deadline :time-zone)
               `(("timeZone" . ,(plist-get deadline :time-zone)))))))
 
+(defun ticktick--baseline (id)
+  "Return the last reconciled snapshot for task ID."
+  (cdr (assoc id (plist-get ticktick--sync-state :baselines))))
+
+(defun ticktick--set-baseline (id snapshot)
+  "Store SNAPSHOT as task ID's baseline, or remove it if nil."
+  (let ((baselines (assoc-delete-all
+                    id (copy-tree (plist-get ticktick--sync-state :baselines)))))
+    (when snapshot (push (cons id (copy-tree snapshot)) baselines))
+    (setq ticktick--sync-state
+          (plist-put ticktick--sync-state :baselines baselines))))
+
 (provide 'ticktick-reconcile)
 ;;; ticktick-reconcile.el ends here
