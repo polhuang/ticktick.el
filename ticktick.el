@@ -309,18 +309,25 @@ This is a plist with keys:
              (push id task-ids))))))
     (nreverse task-ids)))
 
-(defun ticktick--collect-api-task-ids (all-projects)
-  "Extract all task IDs from ALL-PROJECTS API response.
-Returns a list of task IDs."
-  (let ((task-ids nil))
-    (dolist (project all-projects)
-      (let* ((project-id (plist-get project :id))
-             (project-data (ignore-errors
-                            (ticktick-request "GET" (format "/open/v1/project/%s/data" project-id))))
-             (tasks (when project-data (plist-get project-data :tasks))))
-        (dolist (task tasks)
-          (let ((id (plist-get task :id)))
-            (when id (push id task-ids))))))
+(defun ticktick--fetch-project-data (project)
+  "Fetch PROJECT data, signaling an error if the task list is unavailable."
+  (let* ((project-id (plist-get project :id))
+         (data (ticktick-request
+                "GET" (format "/open/v1/project/%s/data" project-id))))
+    (unless (and (listp data) (plist-member data :tasks)
+                 (listp (plist-get data :tasks)))
+      (error "TickTick: missing task list for project %s" project-id))
+    data))
+
+(defun ticktick--collect-api-task-ids (all-project-data)
+  "Extract task IDs from the successfully fetched ALL-PROJECT-DATA."
+  (let (task-ids)
+    (dolist (data all-project-data)
+      (dolist (task (plist-get data :tasks))
+        (let ((id (plist-get task :id)))
+          (unless (and (stringp id) (not (string-empty-p id)))
+            (error "TickTick: task without an ID in project data"))
+          (push id task-ids))))
     (nreverse task-ids)))
 
 (defun ticktick--collect-task-project-map ()
@@ -734,49 +741,47 @@ Starts local server, requests consent through browser, then captures redirect."
         (json-false :false))
     (if (zerop (buffer-size))
         nil
-      (condition-case _ (json-read)
-        (json-error nil)))))
+      (json-read))))
 
 (defun ticktick-request (method endpoint &optional data)
-  "Send a request to the TickTick API.
-METHOD is the HTTP method to use (GET, POST, etc.).
-ENDPOINT is the API endpoint to request.
-DATA is the optional request body data."
+  "Send METHOD to TickTick ENDPOINT with optional body DATA.
+Return parsed response data, or nil for a successful empty response.
+Signal an error on HTTP, transport, or JSON parsing failure.  Retry an
+unauthorized request once after refreshing the token."
   (ticktick-ensure-token)
-  (let* ((url (concat "https://api.ticktick.com" endpoint))
-         (access-token (plist-get ticktick-token :access_token))
-         (headers `(("Authorization" . ,(concat "Bearer " access-token))
-                    ("Content-Type" . "application/json")))
-         (json-data (and data (json-encode data)))
-         (response-data nil))
-    (request url
-      :type method
-      :headers headers
-      :data json-data
-      :parser #'ticktick--parse-json-maybe
-      :sync t
-      :success (cl-function
-                (lambda (&key data response &allow-other-keys)
-                  (let ((status (request-response-status-code response)))
-                    (cond
-                     ((and (>= status 200) (< status 300))
-                      (setq response-data data))
-                     ((= status 401)
-                      (ticktick-refresh-token)
-                      (setq response-data (ticktick-request method endpoint data)))
-                     (t (error "HTTP Error %s" status))))))
-      :error (cl-function
-              (lambda (&key response error-thrown &allow-other-keys)
-                (let ((status (and response (request-response-status-code response))))
-                  (cond
-                   ((= status 401)
-                    (ticktick-refresh-token)
-                    (setq response-data (ticktick-request method endpoint data)))
-                   (t
-                    (message "Request failed: %s"
-                             (or (and response (request-response-data response))
-                                 error-thrown))
-                    (setq response-data nil)))))))
+  (let ((url (concat "https://api.ticktick.com" endpoint))
+        (json-data (and data (json-encode data)))
+        response-data succeeded status failure)
+    ;; Record callback results and signal outside the callbacks: request.el
+    ;; may catch errors signaled inside a callback.
+    (dotimes (attempt 2)
+      (unless succeeded
+        (setq status nil failure nil)
+        (request url
+          :type method
+          :headers `(("Authorization" . ,(concat "Bearer " (plist-get ticktick-token :access_token)))
+                     ("Content-Type" . "application/json"))
+          :data json-data
+          :parser (lambda ()
+                    (when (and (string= method "GET") (zerop (buffer-size)))
+                      (error "Empty response to TickTick GET request"))
+                    (ticktick--parse-json-maybe))
+          :sync t
+          :success (cl-function
+                    (lambda (&key data response &allow-other-keys)
+                      (setq status (request-response-status-code response))
+                      (when (and (numberp status) (<= 200 status) (< status 300))
+                        (setq response-data data succeeded t))))
+          :error (cl-function
+                  (lambda (&key response error-thrown &allow-other-keys)
+                    (setq status (and response (request-response-status-code response))
+                          failure error-thrown))))
+        (unless succeeded
+          (if (and (equal status 401) (= attempt 0))
+              (ticktick-refresh-token)
+            (error "TickTick %s %s failed (HTTP %s): %s"
+                   method endpoint (or status "unavailable")
+                   (or failure "unsuccessful response"))))))
     response-data))
 
 ;;; Org conversion helpers -----------------------------------------------------
@@ -904,8 +909,8 @@ Return the buffer position at the start of the heading."
         (insert (ticktick--task-to-heading task) "\n")
         (ticktick--update-sync-meta)))))
 
-(defun ticktick--sync-project (project)
-  "Sync a single PROJECT with all its tasks."
+(defun ticktick--sync-project (project &optional project-data)
+  "Sync PROJECT using fetched PROJECT-DATA, fetching it if omitted."
   (let* ((project-id (plist-get project :id))
          (project-title (plist-get project :name))
          (project-heading-re (format "^\\* %s$" (regexp-quote project-title)))
@@ -917,8 +922,8 @@ Return the buffer position at the start of the heading."
       (setq project-pos (ticktick--create-project-heading project-title project-id)))
     (goto-char project-pos)
     (outline-show-subtree)
-    (let* ((project-data (ticktick-request "GET" (format "/open/v1/project/%s/data" project-id)))
-           (tasks (plist-get project-data :tasks)))
+    (let ((tasks (plist-get (or project-data (ticktick--fetch-project-data project))
+                            :tasks)))
       (dolist (task tasks)
         (ticktick--sync-task task project-pos)))))
 
@@ -963,9 +968,13 @@ Also detects and handles tasks deleted from TickTick since last sync."
          (projects (ticktick-request "GET" "/open/v1/project"))
          (all-projects (cons inbox-project projects)))
 
-    ;; Collect current API task IDs
-    (let ((current-api-ids (ticktick--collect-api-task-ids all-projects))
-          (previous-api-ids (plist-get ticktick--sync-state :api-task-ids)))
+    ;; Fetch every project before handling deletions or changing local tasks.
+    ;; Reuse this snapshot so a second fetch cannot fail after deletion begins.
+    (let* ((snapshot (mapcar (lambda (project)
+                               (cons project (ticktick--fetch-project-data project)))
+                             all-projects))
+           (current-api-ids (ticktick--collect-api-task-ids (mapcar #'cdr snapshot)))
+           (previous-api-ids (plist-get ticktick--sync-state :api-task-ids)))
 
       ;; Detect deletions from API (tasks that existed before but are gone now)
       (when previous-api-ids
@@ -976,8 +985,8 @@ Also detects and handles tasks deleted from TickTick since last sync."
       ;; Sync all projects and tasks
       (with-current-buffer (find-file-noselect ticktick-sync-file)
         (org-with-wide-buffer
-         (dolist (project all-projects)
-           (ticktick--sync-project project))
+         (dolist (entry snapshot)
+           (ticktick--sync-project (car entry) (cdr entry)))
          (save-buffer)))
 
       ;; Update state with current API task IDs
