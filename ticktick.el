@@ -48,6 +48,9 @@
 ;;    (setq ticktick-client-id "your-client-id")
 ;;    (setq ticktick-client-secret "your-client-secret")
 ;;
+;;    `ticktick-client-secret' also accepts a function of no arguments,
+;;    to fetch it on demand from auth-source.  See the README.
+;;
 ;; 3. Authorize the application:
 ;;    M-x ticktick-authorize
 ;;
@@ -124,8 +127,9 @@
   :group 'ticktick)
 
 (defcustom ticktick-client-secret ""
-  "TickTick client secret."
-  :type 'string
+  "TickTick client secret, or a function of no arguments returning it."
+  :type '(choice (string :tag "Secret")
+                 (function :tag "Function returning the secret"))
   :group 'ticktick)
 
 (defcustom ticktick-auth-scopes "tasks:write tasks:read"
@@ -550,11 +554,18 @@ Deletes or archives them in Org if user confirms."
 
 ;;; Authorization functions ----------------------------------------------------
 
+(defun ticktick--client-secret ()
+  "Return `ticktick-client-secret' as a string, calling it if it is a function."
+  (or (if (functionp ticktick-client-secret)
+          (funcall ticktick-client-secret)
+        ticktick-client-secret)
+      ""))
+
 (defun ticktick--authorization-header ()
   "Create basic authentication header for TickTick API."
   (concat "Basic "
           (base64-encode-string
-           (concat ticktick-client-id ":" ticktick-client-secret) t)))
+           (concat ticktick-client-id ":" (ticktick--client-secret)) t)))
 
 (defun ticktick--make-token-request (form-params)
   "Make a token request with FORM-PARAMS and return the response data."
@@ -634,7 +645,8 @@ Deletes or archives them in Org if user confirms."
   (interactive)
   (message "=== TickTick OAuth Debug Info ===")
   (message "Client ID: %s" (if (string-empty-p ticktick-client-id) "NOT SET" "SET"))
-  (message "Client Secret: %s" (if (string-empty-p ticktick-client-secret) "NOT SET" "SET"))
+  (message "Client Secret: %s"
+           (if (string-empty-p (ticktick--client-secret)) "NOT SET" "SET"))
   (message "Redirect URI: %s" ticktick-redirect-uri)
   (message "Auth Scopes: %s" ticktick-auth-scopes)
   (message "Token file: %s" ticktick-token-file)
@@ -650,7 +662,7 @@ Deletes or archives them in Org if user confirms."
 Starts local server, requests consent through browser, then captures redirect."
   (interactive)
   (unless (and (stringp ticktick-client-id) (not (string-empty-p ticktick-client-id))
-               (stringp ticktick-client-secret) (not (string-empty-p ticktick-client-secret)))
+               (not (string-empty-p (ticktick--client-secret))))
     (user-error "Ticktick-client-id and ticktick-client-secret must be set"))
   (ticktick--start-callback-server)
   (setq ticktick-oauth-state (format "%06x" (random (expt 16 6))))

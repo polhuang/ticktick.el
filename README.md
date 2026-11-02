@@ -56,8 +56,14 @@ Add to your Emacs configuration:
       ticktick-client-secret "your-client-secret")
 ```
 
-Instead of hard-coding your client secret into your configuration, storing it with [auth-source](https://www.gnu.org/software/emacs/manual/html_mono/auth.html) is recommended.
+Instead of hard-coding your client secret into your configuration, storing it with [auth-source](https://www.gnu.org/software/emacs/manual/html_mono/auth.html) is recommended. `ticktick-client-secret` accepts a function of no arguments in place of a string:
 
+```elisp
+(setq ticktick-client-id "your-client-id"
+      ticktick-client-secret
+      (lambda ()
+        (auth-source-pick-first-password :host "ticktick.com" :user ticktick-client-id)))
+```
 ### 3. Authorize Application
 
 ```
