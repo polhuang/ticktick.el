@@ -972,86 +972,19 @@ Return the buffer position at the start of the heading."
       nil)))
 
 (defun ticktick-fetch-to-org ()
-  "Fetch all tasks from TickTick and update org file without duplicating.
-Also detects and handles tasks deleted from TickTick since last sync."
+  "Fetch remote changes, preserving local edits and recording conflicts."
   (interactive)
-  ;; Initialize state tracking
-  (ticktick--ensure-state-initialized)
-
-  ;; Fetch projects and tasks from API
-  (let* ((inbox-project `(:id "inbox" :name "Inbox"))
-         (projects (ticktick-request "GET" "/open/v1/project"))
-         (all-projects (cons inbox-project projects)))
-
-    ;; Fetch every project before handling deletions or changing local tasks.
-    ;; Reuse this snapshot so a second fetch cannot fail after deletion begins.
-    (let* ((snapshot (mapcar (lambda (project)
-                               (cons project (ticktick--fetch-project-data project)))
-                             all-projects))
-           (current-api-ids (ticktick--collect-api-task-ids (mapcar #'cdr snapshot)))
-           (previous-api-ids (plist-get ticktick--sync-state :api-task-ids)))
-
-      ;; Detect deletions from API (tasks that existed before but are gone now)
-      (when previous-api-ids
-        (let ((deleted-ids (cl-set-difference previous-api-ids current-api-ids :test #'string=)))
-          (when deleted-ids
-            (ticktick--handle-api-deletions deleted-ids))))
-
-      ;; Sync all projects and tasks
-      (with-current-buffer (find-file-noselect ticktick-sync-file)
-        (org-with-wide-buffer
-         (dolist (entry snapshot)
-           (ticktick--sync-project (car entry) (cdr entry)))
-         (save-buffer)))
-
-      ;; Update state with current API task IDs
-      (plist-put ticktick--sync-state :api-task-ids current-api-ids)
-      (plist-put ticktick--sync-state :last-sync-time (format-time-string "%FT%T%z"))
-      (ticktick--save-state))))
+  (ticktick--run-sync 'pull))
 
 (defun ticktick-push-from-org ()
-  "Push all updated org tasks back to TickTick.
-Also detects and handles tasks deleted from Org since last sync."
+  "Push local changes after checking remote versions for conflicts."
   (interactive)
-  ;; Initialize state tracking
-  (ticktick--ensure-state-initialized)
-
-  ;; Detect deletions from Org (tasks that existed before but are gone now)
-  (let ((deleted-ids (ticktick--detect-org-deletions)))
-    (when deleted-ids
-      (ticktick--handle-org-deletions deleted-ids)))
-
-  ;; Push normal updates and new tasks
-  (with-current-buffer (find-file-noselect ticktick-sync-file)
-    (org-with-wide-buffer
-     (goto-char (point-min))
-     (while (outline-next-heading)
-       (when (and (= (org-current-level) 2)
-                  (not (org-entry-get nil "TICKTICK_PROJECT_ID")))
-         (when (ticktick--should-sync-p)
-           (let* ((task (ticktick--heading-to-task))
-                  (project-id (org-entry-get nil "TICKTICK_PROJECT_ID" t))
-                  (id (org-entry-get nil "TICKTICK_ID")))
-             (if (and id (not (string-empty-p id)))
-                 (ticktick--update-task task project-id id)
-               (ticktick--create-task task project-id))))))
-     (save-buffer)))
-
-  ;; Update state with current Org task IDs and project map
-  (let ((current-org-ids (ticktick--collect-org-task-ids))
-        (task-project-map (ticktick--collect-task-project-map)))
-    (plist-put ticktick--sync-state :org-task-ids current-org-ids)
-    (plist-put ticktick--sync-state :task-project-map task-project-map)
-    (plist-put ticktick--sync-state :last-sync-time (format-time-string "%FT%T%z"))
-    (ticktick--save-state)))
-
+  (ticktick--run-sync 'push))
 
 (defun ticktick-sync ()
-  "Two-way sync: push local changes first, then fetch remote updates."
+  "Reconcile local and remote tasks against their last successful baseline."
   (interactive)
-  (ticktick-push-from-org)
-  (sit-for 1)
-  (ticktick-fetch-to-org))
+  (ticktick--run-sync))
 
 (defun ticktick--autosync ()
   "Autosync if enabled."

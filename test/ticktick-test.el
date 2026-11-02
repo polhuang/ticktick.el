@@ -33,7 +33,7 @@
           (ticktick-dir (make-temp-file "ticktick-test-" t))
           (ticktick-sync-file (expand-file-name "tasks.org" ticktick-dir))
           (ticktick-token '(:access_token "test"))
-          (ticktick--sync-state '(:api-task-ids ("existing") :last-sync-time "before")))
+          (ticktick--sync-state (copy-tree '(:api-task-ids ("existing") :last-sync-time "before"))))
      (unwind-protect
          (cl-letf (((symbol-function 'ticktick-ensure-token) #'ignore)
                    ((symbol-function 'request) #'ticktick-test--request))
@@ -100,6 +100,7 @@
                        ((200 . "[]") (200 . "{}"))
                        ((200 . "[]") (200 . "{\"tasks\":[{}]}"))))
     (ticktick-test--with-api responses
+      (ticktick--ensure-state-initialized)
       (let ((before (copy-tree ticktick--sync-state))
             (handled nil))
         (cl-letf (((symbol-function 'ticktick--handle-api-deletions)
@@ -109,16 +110,12 @@
           (should (equal before ticktick--sync-state))
           (should-not (file-exists-p ticktick-sync-file)))))))
 
-(ert-deftest ticktick-fetch-empty-project-is-a-valid-deletion-snapshot ()
+(ert-deftest ticktick-fetch-empty-project-is-valid-without-refetch ()
   (ticktick-test--with-api '((200 . "[]") (200 . "{\"tasks\":[]}"))
-    (let (deleted)
-      (cl-letf (((symbol-function 'ticktick--handle-api-deletions)
-                 (lambda (ids) (setq deleted ids))))
-        (ticktick-fetch-to-org)
-        (should (equal deleted '("existing")))
-        (should-not (plist-get ticktick--sync-state :api-task-ids))
-        ;; One request for the project list, one for Inbox; no refetch.
-        (should (= 2 (length ticktick-test--requests)))))))
+    (setq ticktick--sync-state (ticktick--migrate-state nil))
+    (ticktick-fetch-to-org)
+    (should-not (plist-get ticktick--sync-state :api-task-ids))
+    (should (= 2 (length ticktick-test--requests)))))
 
 (ert-deftest ticktick-snapshot-normalizes-tags-and-timed-deadlines ()
   (let* ((task '(:title "Test" :content " body " :tags ("z" "a" "z")
@@ -198,5 +195,66 @@
     (should-not (ticktick--read-remote-task "one" "inbox")))
   (ticktick-test--with-api '((403 . ""))
     (should-error (ticktick--read-remote-task "one" "inbox"))))
+
+(ert-deftest ticktick-sync-import-establishes-baseline-after-saving ()
+  (ticktick-test--with-api
+      '((200 . "[]")
+        (200 . "{\"tasks\":[{\"id\":\"one\",\"title\":\"Imported\",\"projectId\":\"inbox\"}]}")
+        (200 . "{\"id\":\"one\",\"title\":\"Imported\",\"projectId\":\"inbox\"}"))
+    (setq ticktick--sync-state (ticktick--migrate-state nil))
+    (ticktick-sync)
+    (should (equal (plist-get (ticktick--baseline "one") :title) "Imported"))
+    (should (equal (ticktick--baseline "one")
+                   (plist-get (ticktick--local-record "one") :snapshot)))
+    (should-not (plist-get ticktick--sync-state :pending-operations))
+    (should-not (plist-get ticktick--sync-state :conflicts))))
+
+(ert-deftest ticktick-uncertain-creation-is-never-automatically-retried ()
+  (ticktick-test--with-api
+      '((200 . "[]") (200 . "{\"tasks\":[]}") (201 . "")
+        (200 . "[]") (200 . "{\"tasks\":[]}"))
+    (setq ticktick--sync-state (ticktick--migrate-state nil))
+    (with-current-buffer (find-file-noselect ticktick-sync-file)
+      (org-mode)
+      (insert "* Inbox\n:PROPERTIES:\n:TICKTICK_PROJECT_ID: inbox\n:END:\n** TODO New\n")
+      (save-buffer))
+    (ticktick-sync)
+    (should (= 1 (length (plist-get ticktick--sync-state :pending-operations))))
+    (ticktick-sync)
+    (should (= 5 (length ticktick-test--requests)))
+    (should (= 1 (length (plist-get ticktick--sync-state :pending-operations))))))
+
+(ert-deftest ticktick-executor-rechecks-remote-before-local-import ()
+  (ticktick-test--with-api
+      '((200 . "{\"id\":\"one\",\"projectId\":\"inbox\",\"title\":\"Changed again\"}"))
+    (let* ((remote (list :id "one" :key "one" :snapshot
+                         (ticktick--snapshot-from-api
+                          '(:id "one" :projectId "inbox" :title "Original"))))
+           (operation (ticktick--plan-task nil remote nil)))
+      (should-error (ticktick--execute-operation operation))
+      (should-not (ticktick--baseline "one"))
+      (should-not (file-exists-p ticktick-sync-file)))))
+
+(ert-deftest ticktick-interrupted-local-save-recovers-without-remote-write ()
+  (ticktick-test--with-api
+      '((200 . "[]")
+        (200 . "{\"tasks\":[{\"id\":\"one\",\"title\":\"Imported\",\"projectId\":\"inbox\"}]}")
+        (200 . "{\"id\":\"one\",\"title\":\"Imported\",\"projectId\":\"inbox\"}")
+        (200 . "[]")
+        (200 . "{\"tasks\":[{\"id\":\"one\",\"title\":\"Imported\",\"projectId\":\"inbox\"}]}"))
+    (setq ticktick--sync-state (ticktick--migrate-state nil))
+    (cl-letf (((symbol-function 'ticktick--write-local-snapshot)
+               (lambda (&rest _) (error "Disk unavailable"))))
+      (ticktick-sync))
+    (should-not (ticktick--baseline "one"))
+    (should (= 1 (length (plist-get ticktick--sync-state :pending-operations))))
+    ;; Simulate restarting Emacs with only the durable state.
+    (setq ticktick--sync-state nil)
+    (ticktick--load-state)
+    (ticktick-sync)
+    (should (equal (plist-get (ticktick--baseline "one") :title) "Imported"))
+    (should-not (plist-get ticktick--sync-state :pending-operations))
+    (dolist (entry ticktick-test--requests)
+      (should (equal (plist-get (cadr entry) :type) "GET")))))
 
 ;;; ticktick-test.el ends here
